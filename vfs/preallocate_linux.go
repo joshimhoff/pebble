@@ -22,3 +22,10 @@ import "golang.org/x/sys/unix"
 func preallocExtend(fd uintptr, offset, length int64) error {
 	return unix.Fallocate(int(fd), unix.FALLOC_FL_KEEP_SIZE, offset, length)
 }
+
+func Preallocate(f File, offset, length int64) error {
+	if fdFile, ok := f.(fdGetter); ok {
+		return preallocExtend(fdFile.Fd(), offset, length)
+	}
+	return nil
+}
