@@ -175,10 +175,16 @@ type IterOptions struct {
 
 	logger Logger
 	// Level corresponding to this file. Only passed in if constructed by a
-	// levelIter.
+	// levelIter (including regular reads and compaction inputs).
 	level manifest.Level
 	// disableLazyCombinedIteration is an internal testing option.
 	disableLazyCombinedIteration bool
+
+	// SkipSharedFile determines whether the iterator will read shared sstables during
+	// its iteration. If the callback function is not nil, it will pass in the
+	// FileMetadata of the shared table for internal usage (e.g., constructing msg)
+	SkipSharedFile     bool
+	SharedFileCallback func(*manifest.FileMetadata)
 
 	// NB: If adding new Options, you must account for them in iterator
 	// construction and Iterator.SetOptions.
@@ -769,7 +775,11 @@ type Options struct {
 	// UniqueID is a unique ID that's generated for new Pebble instances and
 	// serialized into the Options file. Used to disambiguate this instance's
 	// files from that of others in SharedFS.
-	UniqueID uint16
+	UniqueID uint32
+
+	// PersistentCacheSize is the size of persistent cache in bytes.
+	// If it is zero, no persistent case will be created.
+	PersistentCacheSize uint64
 
 	// TableCache is an initialized TableCache which should be set as an
 	// option if the DB needs to be initialized with a pre-existing table cache.
@@ -1390,8 +1400,8 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 				// TODO(peter): set o.TablePropertyCollectors
 			case "unique_id":
 				var uniqueID uint64
-				uniqueID, err = strconv.ParseUint(value, 10, 16)
-				o.UniqueID = uint16(uniqueID)
+				uniqueID, err = strconv.ParseUint(value, 10, 32)
+				o.UniqueID = uint32(uniqueID)
 			case "validate_on_ingest":
 				o.Experimental.ValidateOnIngest, err = strconv.ParseBool(value)
 			case "wal_dir":
@@ -1478,7 +1488,7 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 	})
 }
 
-func (o *Options) checkOptions(s string) (strictWALTail bool, uniqueID uint16, err error) {
+func (o *Options) checkOptions(s string) (strictWALTail bool, uniqueID uint32, err error) {
 	// TODO(jackson): Refactor to avoid awkwardness of the strictWALTail return value.
 	return strictWALTail, uniqueID, parseOptions(s, func(section, key, value string) error {
 		switch section + "." + key {
@@ -1501,11 +1511,11 @@ func (o *Options) checkOptions(s string) (strictWALTail bool, uniqueID uint16, e
 			}
 		case "Options.unique_id":
 			var uniqueIDint uint64
-			uniqueIDint, err = strconv.ParseUint(value, 10, 16)
+			uniqueIDint, err = strconv.ParseUint(value, 10, 32)
 			if err != nil {
 				return errors.Errorf("pebble: error parsing unique_id value %q: %w", value, err)
 			}
-			uniqueID = uint16(uniqueIDint)
+			uniqueID = uint32(uniqueIDint)
 		}
 		return nil
 	})

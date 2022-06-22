@@ -115,7 +115,7 @@ func TestIngestLoad(t *testing.T) {
 				Comparer: DefaultComparer,
 				FS:       mem,
 			}
-			meta, _, err := ingestLoad(opts, dbVersion, []string{"ext"}, 0, []FileNum{1})
+			meta, _, _, err := ingestLoad(opts, dbVersion, []string{"ext"}, nil, 0, []FileNum{1})
 			if err != nil {
 				return err.Error()
 			}
@@ -201,7 +201,7 @@ func TestIngestLoadRand(t *testing.T) {
 		Comparer: DefaultComparer,
 		FS:       mem,
 	}
-	meta, _, err := ingestLoad(opts, version, paths, 0, pending)
+	meta, _, _, err := ingestLoad(opts, FormatNewest, paths, nil, 0, pending)
 	require.NoError(t, err)
 
 	for _, m := range meta {
@@ -222,7 +222,7 @@ func TestIngestLoadInvalid(t *testing.T) {
 		Comparer: DefaultComparer,
 		FS:       mem,
 	}
-	if _, _, err := ingestLoad(opts, FormatNewest, []string{"invalid"}, 0, []FileNum{1}); err == nil {
+	if _, _, _, err := ingestLoad(opts, FormatNewest, []string{"invalid"}, nil, 0, []FileNum{1}); err == nil {
 		t.Fatalf("expected error, but found success")
 	}
 }
@@ -242,6 +242,7 @@ func TestIngestSortAndVerify(t *testing.T) {
 				var buf bytes.Buffer
 				var meta []*fileMetadata
 				var paths []string
+				var shared []bool
 				var cmpName string
 				d.ScanArgs(t, "cmp", &cmpName)
 				cmp := comparers[cmpName]
@@ -261,8 +262,9 @@ func TestIngestSortAndVerify(t *testing.T) {
 					m := (&fileMetadata{}).ExtendPointKeyBounds(cmp, smallest, largest)
 					meta = append(meta, m)
 					paths = append(paths, strconv.Itoa(i))
+					shared = append(shared, false)
 				}
-				err := ingestSortAndVerify(cmp, meta, paths)
+				err := ingestSortAndVerify(cmp, meta, paths, shared)
 				if err != nil {
 					return fmt.Sprintf("%v\n", err)
 				}
@@ -294,6 +296,7 @@ func TestIngestLink(t *testing.T) {
 			paths := make([]string, 10)
 			meta := make([]*fileMetadata, len(paths))
 			contents := make([][]byte, len(paths))
+			shared := make([]bool, len(paths))
 			for j := range paths {
 				paths[j] = fmt.Sprintf("external%d", j)
 				meta[j] = &fileMetadata{}
@@ -307,13 +310,15 @@ func TestIngestLink(t *testing.T) {
 				_, err = f.Write(append([]byte(nil), contents[j]...))
 				require.NoError(t, err)
 				require.NoError(t, f.Close())
+
+				shared[j] = false
 			}
 
 			if i < count {
 				mem.Remove(paths[i])
 			}
 
-			err := ingestLink(0 /* jobID */, opts, dir, paths, meta)
+			err := ingestLink(0 /* jobID */, opts, dir, paths, meta, shared)
 			if i < count {
 				if err == nil {
 					t.Fatalf("expected error, but found success")
@@ -373,7 +378,7 @@ func TestIngestLinkFallback(t *testing.T) {
 	opts.EnsureDefaults()
 
 	meta := []*fileMetadata{{FileNum: 1}}
-	require.NoError(t, ingestLink(0, opts, "", []string{"source"}, meta))
+	require.NoError(t, ingestLink(0, opts, "", []string{"source"}, meta, []bool{false}))
 
 	dest, err := mem.Open("000001.sst")
 	require.NoError(t, err)
@@ -516,7 +521,7 @@ func BenchmarkIngestOverlappingMemtable(b *testing.B) {
 				assertNoError(w.Close())
 
 				b.StartTimer()
-				assertNoError(d.Ingest([]string{"ext"}))
+				assertNoError(d.Ingest([]string{"ext"}, nil))
 			}
 		})
 	}
@@ -602,7 +607,7 @@ func TestIngestTargetLevel(t *testing.T) {
 			for _, target := range strings.Split(td.Input, "\n") {
 				meta := parseMeta(target)
 				level, err := ingestTargetLevel(
-					d.newIters, d.tableNewRangeKeyIter, IterOptions{logger: d.opts.Logger},
+					d, d.newIters, d.tableNewRangeKeyIter, IterOptions{logger: d.opts.Logger},
 					d.cmp, d.mu.versions.currentVersion(), 1, d.mu.compact.inProgress, meta,
 				)
 				if err != nil {
@@ -776,8 +781,8 @@ func TestIngestError(t *testing.T) {
 			}()
 
 			inj.SetIndex(i)
-			err1 := d.Ingest([]string{"ext0"})
-			err2 := d.Ingest([]string{"ext1"})
+			err1 := d.Ingest([]string{"ext0"}, nil)
+			err2 := d.Ingest([]string{"ext1"}, nil)
 			err := firstError(err1, err2)
 			if err != nil && !errors.Is(err, errorfs.ErrInjected) {
 				t.Fatal(err)
@@ -818,7 +823,7 @@ func TestIngestIdempotence(t *testing.T) {
 	for i := 0; i < count; i++ {
 		ingestPath := fs.PathJoin(dir, fmt.Sprintf("ext%d", i))
 		require.NoError(t, fs.Link(path, ingestPath))
-		require.NoError(t, d.Ingest([]string{ingestPath}))
+		require.NoError(t, d.Ingest([]string{ingestPath}, nil))
 	}
 	require.NoError(t, d.Close())
 }
@@ -861,7 +866,7 @@ func TestIngestCompact(t *testing.T) {
 			// flushed.
 			require.NoError(t, d.Set(key, nil, nil))
 		}
-		require.NoError(t, d.Ingest([]string{src(i)}))
+		require.NoError(t, d.Ingest([]string{src(i)}, nil))
 	}
 
 	require.NoError(t, d.Close())
@@ -898,7 +903,7 @@ func TestConcurrentIngest(t *testing.T) {
 	// Perform N ingestions concurrently.
 	for i := 0; i < cap(errCh); i++ {
 		go func(i int) {
-			err := d.Ingest([]string{src(i)})
+			err := d.Ingest([]string{src(i)}, nil)
 			if err == nil {
 				if _, err = d.opts.FS.Stat(src(i)); oserror.IsNotExist(err) {
 					err = nil
@@ -943,7 +948,7 @@ func TestConcurrentIngestCompact(t *testing.T) {
 					require.NoError(t, w.Set([]byte(k), nil))
 				}
 				require.NoError(t, w.Close())
-				require.NoError(t, d.Ingest([]string{"ext"}))
+				require.NoError(t, d.Ingest([]string{"ext"}, nil))
 			}
 
 			compact := func(start, end string) {
@@ -974,11 +979,11 @@ func TestConcurrentIngestCompact(t *testing.T) {
 
 			expectLSM(`
 0.0:
-  000005:[a#2,SET-a#2,SET]
-  000007:[c#4,SET-c#4,SET]
+  000005:[a#5,SET-a#5,SET]
+  000007:[c#7,SET-c#7,SET]
 6:
-  000004:[a#1,SET-a#1,SET]
-  000006:[c#3,SET-c#3,SET]
+  000004:[a#4,SET-a#4,SET]
+  000006:[c#6,SET-c#6,SET]
 `)
 
 			// At this point ingestion of an sstable containing only key "b" will be
@@ -1001,9 +1006,9 @@ func TestConcurrentIngestCompact(t *testing.T) {
 
 				expectLSM(`
 0.0:
-  000009:[b#5,SET-b#5,SET]
+  000009:[b#8,SET-b#8,SET]
 6:
-  000008:[a#0,SET-c#0,SET]
+  000008:[a#3,SET-c#3,SET]
 `)
 
 			case 1:
@@ -1063,7 +1068,7 @@ func TestIngestFlushQueuedMemTable(t *testing.T) {
 			require.NoError(t, w.Set([]byte(k), nil))
 		}
 		require.NoError(t, w.Close())
-		stats, err := d.IngestWithStats([]string{"ext"})
+		stats, err := d.IngestWithStats([]string{"ext"}, nil)
 		require.NoError(t, err)
 		require.Equal(t, stats.ApproxIngestedIntoL0Bytes, stats.Bytes)
 		require.Less(t, uint64(0), stats.Bytes)
@@ -1091,7 +1096,7 @@ func TestIngestStats(t *testing.T) {
 			require.NoError(t, w.Set([]byte(k), nil))
 		}
 		require.NoError(t, w.Close())
-		stats, err := d.IngestWithStats([]string{"ext"})
+		stats, err := d.IngestWithStats([]string{"ext"}, nil)
 		require.NoError(t, err)
 		if expectedLevel == 0 {
 			require.Equal(t, stats.ApproxIngestedIntoL0Bytes, stats.Bytes)
@@ -1139,7 +1144,7 @@ func TestIngestFlushQueuedLargeBatch(t *testing.T) {
 			require.NoError(t, w.Set([]byte(k), nil))
 		}
 		require.NoError(t, w.Close())
-		require.NoError(t, d.Ingest([]string{"ext"}))
+		require.NoError(t, d.Ingest([]string{"ext"}, nil))
 	}
 
 	ingest("a")
@@ -1177,7 +1182,7 @@ func TestIngestMemtablePendingOverlap(t *testing.T) {
 			require.NoError(t, w.Set([]byte(k), nil))
 		}
 		require.NoError(t, w.Close())
-		require.NoError(t, d.Ingest([]string{"ext"}))
+		require.NoError(t, d.Ingest([]string{"ext"}, nil))
 	}
 
 	var wg sync.WaitGroup
@@ -1294,7 +1299,7 @@ func TestIngestFileNumReuseCrash(t *testing.T) {
 	for _, f := range files {
 		func() {
 			defer func() { err = recover().(error) }()
-			err = d.Ingest([]string{fs.PathJoin(dir, f)})
+			err = d.Ingest([]string{fs.PathJoin(dir, f)}, nil)
 		}()
 		if err == nil || !errors.Is(err, errorfs.ErrInjected) {
 			t.Fatalf("expected injected error, got %v", err)
@@ -1691,7 +1696,7 @@ func TestIngestValidation(t *testing.T) {
 				require.NoError(t, err)
 
 				// Ingest the external table.
-				err = d.Ingest([]string{ingestTableName})
+				err = d.Ingest([]string{ingestTableName}, nil)
 				if err != nil {
 					et.errLoc = errLocationIngest
 					et.err = err
@@ -1777,7 +1782,7 @@ func BenchmarkManySSTables(b *testing.B) {
 						require.NoError(b, w.Close())
 						paths = append(paths, n)
 					}
-					require.NoError(b, d.Ingest(paths))
+					require.NoError(b, d.Ingest(paths, nil))
 
 					{
 						const broadIngest = "broad.sst"
@@ -1787,7 +1792,7 @@ func BenchmarkManySSTables(b *testing.B) {
 						require.NoError(b, w.Set([]byte("0"), nil))
 						require.NoError(b, w.Set([]byte("Z"), nil))
 						require.NoError(b, w.Close())
-						require.NoError(b, d.Ingest([]string{broadIngest}))
+						require.NoError(b, d.Ingest([]string{broadIngest}, nil))
 					}
 
 					switch op {
@@ -1812,7 +1817,7 @@ func runBenchmarkManySSTablesIngest(b *testing.B, d *DB, fs vfs.FS, count int) {
 		w := sstable.NewWriter(f, sstable.WriterOptions{})
 		require.NoError(b, w.Set([]byte(n), nil))
 		require.NoError(b, w.Close())
-		require.NoError(b, d.Ingest([]string{n}))
+		require.NoError(b, d.Ingest([]string{n}, nil))
 	}
 }
 

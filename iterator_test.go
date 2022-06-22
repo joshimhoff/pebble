@@ -540,7 +540,7 @@ func TestIterator(t *testing.T) {
 			vals = vals[:0]
 			for _, key := range strings.Split(d.Input, "\n") {
 				j := strings.Index(key, ":")
-				keys = append(keys, base.ParseInternalKey(key[:j]))
+				keys = append(keys, base.ParseInternalKeyWithSeqNumOffset(key[:j], sstable.SeqNumZero))
 				vals = append(vals, []byte(key[j+1:]))
 			}
 			return ""
@@ -560,6 +560,7 @@ func TestIterator(t *testing.T) {
 					if err != nil {
 						return err.Error()
 					}
+					seqNum += sstable.SeqNumZero
 				case "lower":
 					opts.LowerBound = []byte(arg.Vals[0])
 				case "upper":
@@ -823,6 +824,7 @@ func TestIteratorTableFilter(t *testing.T) {
 					if err != nil {
 						return err.Error()
 					}
+					seqNum += sstable.SeqNumZero
 					iterOpts.TableFilter = func(userProps map[string]string) bool {
 						minSeqNum, err := strconv.ParseUint(userProps["test.min-seq-num"], 10, 64)
 						if err != nil {
@@ -906,6 +908,7 @@ func TestIteratorNextPrev(t *testing.T) {
 					if err != nil {
 						return err.Error()
 					}
+					seqNum += sstable.SeqNumZero
 				default:
 					return fmt.Sprintf("%s: unknown arg: %s", td.Cmd, arg.Key)
 				}
@@ -1215,7 +1218,7 @@ func TestIteratorSeekOptErrors(t *testing.T) {
 			vals = vals[:0]
 			for _, key := range strings.Split(d.Input, "\n") {
 				j := strings.Index(key, ":")
-				keys = append(keys, base.ParseInternalKey(key[:j]))
+				keys = append(keys, base.ParseInternalKeyWithSeqNumOffset(key[:j], sstable.SeqNumZero))
 				vals = append(vals, []byte(key[j+1:]))
 			}
 			return ""

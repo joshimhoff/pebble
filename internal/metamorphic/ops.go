@@ -443,7 +443,7 @@ func (o *ingestOp) run(t *test, h historyRecorder) {
 	}
 
 	err = firstError(err, withRetries(func() error {
-		return t.db.Ingest(paths)
+		return t.db.Ingest(paths, nil)
 	}))
 
 	h.Recordf("%s // %v", o, err)

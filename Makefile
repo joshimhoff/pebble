@@ -4,7 +4,6 @@ GOFLAGS :=
 STRESSFLAGS :=
 TAGS := invariants
 TESTS := .
-LATEST_RELEASE := $(shell git fetch origin && git branch -r --list '*/crl-release-*' | grep -o 'crl-release-.*$$' | sort | tail -1)
 
 .PHONY: all
 all:
@@ -24,7 +23,7 @@ test:
 	${GO} test -tags '$(TAGS)' ${testflags} -run ${TESTS} ${PKG}
 
 .PHONY: testrace
-testrace: testflags += -race -timeout 20m
+testrace: testflags += -v -race -timeout 20m
 testrace: test
 
 .PHONY: lint

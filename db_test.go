@@ -414,13 +414,13 @@ func TestLargeBatch(t *testing.T) {
 
 	// Verify this results in one L0 table being created.
 	require.NoError(t, try(100*time.Microsecond, 20*time.Second,
-		verifyLSM("0.0:\n  000005:[a#1,SET-a#1,SET]\n")))
+		verifyLSM("0.0:\n  000005:[a#4,SET-a#4,SET]\n")))
 
 	require.NoError(t, d.Set([]byte("b"), bytes.Repeat([]byte("b"), 512), nil))
 
 	// Verify this results in a second L0 table being created.
 	require.NoError(t, try(100*time.Microsecond, 20*time.Second,
-		verifyLSM("0.0:\n  000005:[a#1,SET-a#1,SET]\n  000007:[b#2,SET-b#2,SET]\n")))
+		verifyLSM("0.0:\n  000005:[a#4,SET-a#4,SET]\n  000007:[b#5,SET-b#5,SET]\n")))
 
 	// Allocate a bunch of batches to exhaust the batchPool. None of these
 	// batches should have a non-zero count.
@@ -805,7 +805,7 @@ func TestMemTableReservation(t *testing.T) {
 	helloWorld := []byte("hello world")
 	value := opts.Cache.Alloc(len(helloWorld))
 	copy(value.Buf(), helloWorld)
-	opts.Cache.Set(tmpID, 0, 0, value).Release()
+	opts.Cache.Set(tmpID, 0, 0, value, false).Release()
 
 	d, err := Open("", opts)
 	require.NoError(t, err)
@@ -822,7 +822,7 @@ func TestMemTableReservation(t *testing.T) {
 		t.Fatalf("expected 2 refs, but found %d", refs)
 	}
 	// Verify the memtable reservation has caused our test block to be evicted.
-	if h := opts.Cache.Get(tmpID, 0, 0); h.Get() != nil {
+	if h := opts.Cache.Get(tmpID, 0, 0, false); h.Get() != nil {
 		t.Fatalf("expected failure, but found success: %s", h.Get())
 	}
 
@@ -1087,7 +1087,7 @@ func TestDBClosed(t *testing.T) {
 	require.True(t, errors.Is(catch(func() { _, _, _ = d.Get(nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.Delete(nil, nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.DeleteRange(nil, nil, nil) }), ErrClosed))
-	require.True(t, errors.Is(catch(func() { _ = d.Ingest(nil) }), ErrClosed))
+	require.True(t, errors.Is(catch(func() { _ = d.Ingest(nil, nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.LogData(nil, nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.Merge(nil, nil, nil) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.RatchetFormatMajorVersion(FormatNewest) }), ErrClosed))
@@ -1159,7 +1159,7 @@ func TestDBConcurrentCompactClose(t *testing.T) {
 			})
 			require.NoError(t, w.Set([]byte(fmt.Sprint(j)), nil))
 			require.NoError(t, w.Close())
-			require.NoError(t, d.Ingest([]string{path}))
+			require.NoError(t, d.Ingest([]string{path}, nil))
 		}
 
 		require.NoError(t, d.Close())

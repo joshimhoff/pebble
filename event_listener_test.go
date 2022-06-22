@@ -238,7 +238,7 @@ func TestEventListener(t *testing.T) {
 			if err := w.Close(); err != nil {
 				return err.Error()
 			}
-			if err := d.Ingest([]string{"ext/0"}); err != nil {
+			if err := d.Ingest([]string{"ext/0"}, nil); err != nil {
 				return err.Error()
 			}
 			return buf.String()
