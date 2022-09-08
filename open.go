@@ -367,6 +367,16 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	d.newIters = d.tableCache.newIters
 	d.tableNewRangeKeyIter = d.tableCache.newRangeKeyIter
 
+	// If the Options specify a format major version higher than the
+	// loaded database's, upgrade it. If this is a new database, this
+	// code path also performs an initial upgrade from the starting
+	// implicit MostCompatible version.
+	if !d.opts.ReadOnly && opts.FormatMajorVersion > d.mu.formatVers.vers {
+		if err := d.ratchetFormatMajorVersionLocked(opts.FormatMajorVersion); err != nil {
+			return nil, err
+		}
+	}
+
 	sort.Slice(logFiles, func(i, j int) bool {
 		return logFiles[i].num < logFiles[j].num
 	})

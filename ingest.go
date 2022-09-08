@@ -940,7 +940,6 @@ func (d *DB) ingest(
 			}
 		}
 	}
-
 	info := TableIngestInfo{
 		JobID:        jobID,
 		GlobalSeqNum: meta[0].SmallestSeqNum,

@@ -2687,9 +2687,9 @@ func (d *DB) runCompaction(
 		// If the output SSTable falls in lower levels than sharedLevel, it will be moved to the shared
 		// file system asynchronously
 		if d.opts.SharedFS != nil && c.outputLevel.level >= sharedLevel {
-			if writerMeta.HasRangeKeys {
-				panic("runCompaction: shared sst does not support range keys")
-			}
+			//if writerMeta.HasRangeKeys {
+			//	panic("runCompaction: shared sst does not support range keys")
+			//}
 
 			setSharedSSTMetadata(meta, d.opts.UniqueID)
 
