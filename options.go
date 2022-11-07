@@ -184,7 +184,7 @@ type IterOptions struct {
 	// its iteration. If the callback function is not nil, it will pass in the
 	// FileMetadata of the shared table for internal usage (e.g., constructing msg)
 	SkipSharedFile     bool
-	SharedFileCallback func(*manifest.FileMetadata)
+	SharedFileCallback func(meta SharedSSTMeta)
 
 	// NB: If adding new Options, you must account for them in iterator
 	// construction and Iterator.SetOptions.

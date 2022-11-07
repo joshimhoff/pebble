@@ -638,7 +638,32 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 		if l.tableOpts.SkipSharedFile && file.IsShared {
 			// No need to check if the file is locally created or not as this is mostly for exporting
 			if l.tableOpts.SharedFileCallback != nil {
-				l.tableOpts.SharedFileCallback(file)
+				smallestKey := file.Smallest
+				largestKey := file.Largest
+				if l.tableOpts.LowerBound != nil && l.cmp(smallestKey.UserKey, l.tableOpts.LowerBound) < 0 {
+					smallestKey = base.MakeInternalKey(l.tableOpts.LowerBound, file.LargestSeqNum, base.InternalKeyKindMax)
+				}
+				if l.tableOpts.UpperBound != nil && l.cmp(largestKey.UserKey, l.tableOpts.UpperBound) > 0 {
+					largestKey = base.MakeInternalKey(l.tableOpts.UpperBound, file.SmallestSeqNum, base.InternalKeyKindDelete)
+				}
+				smallest := make([]byte, smallestKey.Size())
+				smallestKey.Encode(smallest)
+				largest := make([]byte, largestKey.Size())
+				largestKey.Encode(largest)
+
+				fileSmallest := make([]byte, file.FileSmallest.Size())
+				file.FileSmallest.Encode(fileSmallest)
+				fileLargest := make([]byte, file.Largest.Size())
+				file.Largest.Encode(fileLargest)
+				meta := SharedSSTMeta{
+					CreatorUniqueID: file.CreatorUniqueID,
+					PhysicalFileNum: uint64(file.PhysicalFileNum),
+					Smallest:        smallest,
+					Largest:         largest,
+					FileSmallest:    fileSmallest,
+					FileLargest:     fileLargest,
+				}
+				l.tableOpts.SharedFileCallback(meta)
 			}
 			if dir < 0 {
 				file = l.files.Prev()

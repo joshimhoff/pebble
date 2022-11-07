@@ -100,11 +100,11 @@ func ingestLoad1(
 	if isShared {
 		meta.IsShared = true
 		meta.CreatorUniqueID = smeta.CreatorUniqueID
-		meta.PhysicalFileNum = smeta.PhysicalFileNum
-		meta.Smallest = smeta.Smallest
-		meta.Largest = smeta.Largest
-		meta.FileSmallest = smeta.FileSmallest
-		meta.FileLargest = smeta.FileLargest
+		meta.PhysicalFileNum = base.FileNum(smeta.PhysicalFileNum)
+		meta.Smallest = base.DecodeInternalKey(smeta.Smallest)
+		meta.Largest = base.DecodeInternalKey(smeta.Largest)
+		meta.FileSmallest = base.DecodeInternalKey(smeta.FileSmallest)
+		meta.FileLargest = base.DecodeInternalKey(smeta.FileLargest)
 	}
 
 	// Avoid loading into the table cache for collecting stats if we
@@ -267,13 +267,10 @@ func ingestLoad(
 	if opts.SharedFS != nil && smeta != nil {
 		for i := range smeta {
 			j := i + len(paths)
-			spath := base.MakeSharedSSTPath(opts.SharedFS, opts.SharedDir, smeta[i].CreatorUniqueID, smeta[i].PhysicalFileNum)
+			spath := base.MakeSharedSSTPath(opts.SharedFS, opts.SharedDir, smeta[i].CreatorUniqueID, base.FileNum(smeta[i].PhysicalFileNum))
 			m, err := ingestLoad1(opts, fmv, spath, smeta[i], true, cacheID, pending[j])
 			if err != nil {
 				return nil, nil, nil, err
-			}
-			if m == nil {
-				panic("ingestLoad: shared sst is empty which is not handled now")
 			}
 			if m != nil {
 				meta = append(meta, m)
@@ -322,6 +319,9 @@ func ingestSortAndVerify(cmp Compare, meta []*fileMetadata, paths []string, shar
 	})
 
 	for i := 1; i < len(meta); i++ {
+		if shared[i] || shared[i-1] {
+			continue
+		}
 		if sstableKeyCompare(cmp, meta[i-1].Largest, meta[i].Smallest) >= 0 {
 			return errors.New("pebble: external sstables have overlapping ranges")
 		}
@@ -723,12 +723,10 @@ func ingestTargetLevel(
 
 // SharedSSTMeta records the necessary information when ingesting a shared sstable
 type SharedSSTMeta struct {
-	CreatorUniqueID uint32
-	PhysicalFileNum base.FileNum
-	Smallest        InternalKey
-	Largest         InternalKey
-	FileSmallest    InternalKey
-	FileLargest     InternalKey
+	CreatorUniqueID           uint32
+	PhysicalFileNum           uint64
+	Smallest, Largest         []byte
+	FileSmallest, FileLargest []byte
 }
 
 // Ingest ingests a set of sstables into the DB. Ingestion of the files is
@@ -809,6 +807,32 @@ func (d *DB) IngestWithStats(paths []string, smeta []SharedSSTMeta) (IngestOpera
 	return d.ingest(paths, smeta, ingestTargetLevel)
 }
 
+func sortAndMergeSpans(cmp Compare, spans []keyspan.Span) []keyspan.Span {
+	if len(spans) == 0 {
+		return spans
+	}
+	sort.Slice(spans, func(i, j int) bool {
+		cmpVal := cmp(spans[i].Start, spans[j].Start)
+		if cmpVal == 0 {
+			return cmp(spans[i].End, spans[j].End) < 0
+		}
+		return cmpVal < 0
+	})
+	j := 0
+	for i := 1; i < len(spans); i++ {
+		if cmp(spans[j].End, spans[i].Start) >= 0 {
+			// Overlap.
+			if cmp(spans[j].End, spans[i].End) < 0 {
+				spans[j].End = spans[i].End
+			}
+		} else {
+			j++
+			spans[j] = spans[i]
+		}
+	}
+	return spans[:j+1]
+}
+
 func (d *DB) ingest(
 	paths []string, smeta []SharedSSTMeta, targetLevelFunc ingestTargetLevelFunc,
 ) (IngestOperationStats, error) {
@@ -852,6 +876,14 @@ func (d *DB) ingest(
 	if err := ingestSortAndVerify(d.cmp, meta, paths, shared); err != nil {
 		return IngestOperationStats{}, err
 	}
+	sharedSpans := []keyspan.Span{}
+	for i, m := range meta {
+		if !shared[i] {
+			continue
+		}
+		sharedSpans = append(sharedSpans, keyspan.Span{Start: m.Smallest.UserKey, End: m.Largest.UserKey})
+	}
+	sharedSpans = sortAndMergeSpans(d.cmp, sharedSpans)
 
 	// Hard link the sstables into the DB directory. Since the sstables aren't
 	// referenced by a version, they won't be used. If the hard linking fails
@@ -919,7 +951,7 @@ func (d *DB) ingest(
 
 		// Assign the sstables to the correct level in the LSM and apply the
 		// version edit.
-		ve, err = d.ingestApply(jobID, meta, targetLevelFunc)
+		ve, err = d.ingestApply(jobID, meta, targetLevelFunc, sharedSpans)
 	}
 
 	d.commit.AllocateSeqNum(len(meta), prepare, apply)
@@ -979,7 +1011,7 @@ type ingestTargetLevelFunc func(
 ) (int, error)
 
 func (d *DB) ingestApply(
-	jobID int, meta []*fileMetadata, findTargetLevel ingestTargetLevelFunc,
+	jobID int, meta []*fileMetadata, findTargetLevel ingestTargetLevelFunc, sharedSpans []keyspan.Span,
 ) (*versionEdit, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

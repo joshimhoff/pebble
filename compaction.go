@@ -2686,7 +2686,7 @@ func (d *DB) runCompaction(
 
 		// If the output SSTable falls in lower levels than sharedLevel, it will be moved to the shared
 		// file system asynchronously
-		if d.opts.SharedFS != nil && c.outputLevel.level >= sharedLevel {
+		if d.opts.SharedFS != nil && c.outputLevel.level >= sharedLevel && !writerMeta.HasRangeKeys {
 			//if writerMeta.HasRangeKeys {
 			//	panic("runCompaction: shared sst does not support range keys")
 			//}
@@ -3383,9 +3383,7 @@ func init() {
 		meta.FileSmallest, meta.FileLargest = meta.Smallest.Clone(), meta.Largest.Clone()
 
 		// assign virtual boundaries for all boundary properties
-		lb, ub := meta.Smallest.Clone(), meta.Largest.Clone()
-		meta.Smallest, meta.Largest = lb, ub
-		meta.SmallestPointKey, meta.LargestPointKey = lb, ub
+		meta.SmallestPointKey, meta.LargestPointKey = meta.SmallestPointKey.Clone(), meta.LargestPointKey.Clone()
 
 		meta.CreatorUniqueID = creatorUniqueID
 		meta.PhysicalFileNum = meta.FileNum
