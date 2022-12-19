@@ -196,6 +196,7 @@ func createExternalPointIter(it *Iterator) (internalIterator, error) {
 			pointIter, err = r.NewIterWithBlockPropertyFilters(
 				it.opts.LowerBound,
 				it.opts.UpperBound,
+				it.opts.UpperBoundIsInclusive,
 				nil,   /* BlockPropertiesFilterer */
 				false, /* useFilterBlock */
 				&it.stats.InternalStats,

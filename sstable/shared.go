@@ -85,6 +85,19 @@ func (i *tableIterator) cmpSharedBound(key []byte) int {
 // which exposes a default value (e.g. 0) and it might direct the code to a wrong path.
 // So for now I will just leave these two flags as is..
 
+func (i *tableIterator) isVirtual() bool {
+	var r *Reader
+	switch i.Iterator.(type) {
+	case *twoLevelIterator:
+		r = i.Iterator.(*twoLevelIterator).reader
+	case *singleLevelIterator:
+		r = i.Iterator.(*singleLevelIterator).reader
+	default:
+		panic("tableIterator: i.Iterator is not singleLevelIterator or twoLevelIterator")
+	}
+	return r.meta != nil && r.meta.CreatorUniqueID != 0 && r.meta.CreatorUniqueID == r.dbUniqueID
+}
+
 func (i *tableIterator) isLocallyCreated() bool {
 	var r *Reader
 	switch i.Iterator.(type) {

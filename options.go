@@ -111,6 +111,9 @@ type IterOptions struct {
 	// boundary the iterator will return Valid()==false. Setting UpperBound
 	// effectively truncates the key space visible to the iterator.
 	UpperBound []byte
+	// UpperBoundIsInclusive turns the above upper bound into an inclusive bound.
+	// Only supported by sstable iterators.
+	UpperBoundIsInclusive bool
 	// TableFilter can be used to filter the tables that are scanned during
 	// iteration based on the user properties. Return true to scan the table and
 	// false to skip scanning. This function must be thread-safe since the same

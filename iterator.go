@@ -157,6 +157,58 @@ func (s *RangeKeyIteratorStats) Merge(o RangeKeyIteratorStats) {
 // LazyValue is a lazy value. See the long comment in base.LazyValue.
 type LazyValue = base.LazyValue
 
+// InternalIterator exports the internalIterator type.
+type InternalIterator struct {
+	opts            IterOptions
+	comparer        *base.Comparer
+	iter            internalIterator
+	readState       *readState
+	iterKey         *InternalKey
+	iterValue       LazyValue
+	alloc           *iterAlloc
+	newIters        tableNewIters
+	newIterRangeKey keyspan.TableNewSpanIter
+	seqNum          uint64
+}
+
+func (i *InternalIterator) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, LazyValue) {
+	return i.iter.SeekGE(key, flags)
+}
+
+func (i *InternalIterator) First() (*base.InternalKey, base.LazyValue) {
+	return i.iter.First()
+}
+
+func (i *InternalIterator) Next() (*base.InternalKey, base.LazyValue) {
+	return i.iter.Next()
+}
+
+func (i *InternalIterator) Prev() (*base.InternalKey, base.LazyValue) {
+	return i.iter.Prev()
+}
+
+func (i *InternalIterator) Error() error {
+	return i.iter.Error()
+}
+
+func (i *InternalIterator) Close() error {
+	if err := i.iter.Close(); err != nil {
+		return err
+	}
+	i.readState.unref()
+	return nil
+}
+
+func (i *InternalIterator) SetBounds(lower, upper []byte) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (i *InternalIterator) String() string {
+	//TODO implement me
+	panic("implement me")
+}
+
 // Iterator iterates over a DB's key/value pairs in key order.
 //
 // An iterator must be closed after use, but it is not necessary to read an

@@ -469,6 +469,7 @@ func runTestReader(
 				iter, err := r.NewIterWithBlockPropertyFilters(
 					nil, /* lower */
 					nil, /* upper */
+					false,
 					filterer,
 					true, /* use filter block */
 					&stats,

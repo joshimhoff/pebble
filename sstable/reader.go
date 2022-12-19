@@ -216,9 +216,10 @@ type Iterator interface {
 type singleLevelIterator struct {
 	cmp Compare
 	// Global lower/upper bound for the iterator.
-	lower []byte
-	upper []byte
-	bpfs  *BlockPropertiesFilterer
+	lower               []byte
+	upper               []byte
+	upperBoundInclusive bool
+	bpfs                *BlockPropertiesFilterer
 	// Per-block lower/upper bound. Nil if the bound does not apply to the block
 	// because we determined the block lies completely within the bound.
 	blockLower []byte
@@ -409,7 +410,7 @@ func checkRangeKeyFragmentBlockIterator(obj interface{}) {
 // between different Readers.
 func (i *singleLevelIterator) init(
 	r *Reader,
-	lower, upper []byte,
+	lower, upper []byte, upperBoundInclusive bool,
 	filterer *BlockPropertiesFilterer,
 	useFilter bool,
 	stats *base.InternalIteratorStats,
@@ -425,6 +426,7 @@ func (i *singleLevelIterator) init(
 
 	i.lower = lower
 	i.upper = upper
+	i.upperBoundInclusive = upperBoundInclusive
 	i.bpfs = filterer
 	i.useFilter = useFilter
 	i.reader = r
@@ -866,7 +868,7 @@ func (i *singleLevelIterator) seekGEHelper(
 			// the next block starts with keys >= ikey.UserKey since even
 			// though this is the block separator, the same user key can span
 			// multiple blocks. Since upper is exclusive we use >= below.
-			if i.upper != nil && i.cmp(ikey.UserKey, i.upper) >= 0 {
+			if i.upper != nil && ((i.cmp(ikey.UserKey, i.upper) >= 0 && !i.upperBoundInclusive) || i.cmp(ikey.UserKey, i.upper) > 0) {
 				i.exhaustedBounds = +1
 				return nil, base.LazyValue{}
 			}
@@ -1112,7 +1114,7 @@ func (i *singleLevelIterator) firstInternal() (*InternalKey, base.LazyValue) {
 		// ikey.UserKey since even though this is the block separator, the
 		// same user key can span multiple blocks. Since upper is exclusive we
 		// use >= below.
-		if i.upper != nil && i.cmp(ikey.UserKey, i.upper) >= 0 {
+		if i.upper != nil && ((i.cmp(ikey.UserKey, i.upper) >= 0 && !i.upperBoundInclusive) || i.cmp(ikey.UserKey, i.upper) > 0) {
 			i.exhaustedBounds = +1
 			return nil, base.LazyValue{}
 		}
@@ -1316,7 +1318,7 @@ func (i *singleLevelIterator) skipForward() (*InternalKey, base.LazyValue) {
 			// keys >= key.UserKey since even though this is the block
 			// separator, the same user key can span multiple blocks. Since
 			// upper is exclusive we use >= below.
-			if i.upper != nil && i.cmp(key.UserKey, i.upper) >= 0 {
+			if i.upper != nil && ((i.cmp(key.UserKey, i.upper) >= 0 && !i.upperBoundInclusive) || i.cmp(key.UserKey, i.upper) > 0) {
 				i.exhaustedBounds = +1
 				return nil, base.LazyValue{}
 			}
@@ -1713,7 +1715,7 @@ func (i *twoLevelIterator) resolveMaybeExcluded(dir int8) intersectsResult {
 
 func (i *twoLevelIterator) init(
 	r *Reader,
-	lower, upper []byte,
+	lower, upper []byte, upperBoundInclusive bool,
 	filterer *BlockPropertiesFilterer,
 	useFilter bool,
 	stats *base.InternalIteratorStats,
@@ -1729,6 +1731,7 @@ func (i *twoLevelIterator) init(
 
 	i.lower = lower
 	i.upper = upper
+	i.upperBoundInclusive = upperBoundInclusive
 	i.bpfs = filterer
 	i.useFilter = useFilter
 	i.reader = r
@@ -1836,7 +1839,7 @@ func (i *twoLevelIterator) SeekGE(
 			// ikey.UserKey since even though this is the block separator, the
 			// same user key can span multiple index blocks. Since upper is
 			// exclusive we use >= below.
-			if i.upper != nil && i.cmp(ikey.UserKey, i.upper) >= 0 {
+			if i.upper != nil && ((i.cmp(ikey.UserKey, i.upper) >= 0 && !i.upperBoundInclusive) || i.cmp(ikey.UserKey, i.upper) > 0) {
 				i.exhaustedBounds = +1
 			}
 			// Fall through to skipForward.
@@ -2010,7 +2013,7 @@ func (i *twoLevelIterator) SeekPrefixGE(
 			// ikey.UserKey since even though this is the block separator, the
 			// same user key can span multiple index blocks. Since upper is
 			// exclusive we use >= below.
-			if i.upper != nil && i.cmp(ikey.UserKey, i.upper) >= 0 {
+			if i.upper != nil && ((i.cmp(ikey.UserKey, i.upper) >= 0 && !i.upperBoundInclusive) || i.cmp(ikey.UserKey, i.upper) > 0) {
 				i.exhaustedBounds = +1
 			}
 			// Fall through to skipForward.
@@ -2183,7 +2186,7 @@ func (i *twoLevelIterator) First() (*InternalKey, base.LazyValue) {
 		// starts with keys >= ikey.UserKey since even though this is the
 		// block separator, the same user key can span multiple index blocks.
 		// Since upper is exclusive we use >= below.
-		if i.upper != nil && i.cmp(ikey.UserKey, i.upper) >= 0 {
+		if i.upper != nil && ((i.cmp(ikey.UserKey, i.upper) >= 0 && !i.upperBoundInclusive) || i.cmp(ikey.UserKey, i.upper) > 0) {
 			i.exhaustedBounds = +1
 		}
 	}
@@ -2337,7 +2340,7 @@ func (i *twoLevelIterator) skipForward() (*InternalKey, base.LazyValue) {
 			// this is the block separator, the same user key can span
 			// multiple index blocks. Since upper is exclusive we use >=
 			// below.
-			if i.upper != nil && i.cmp(ikey.UserKey, i.upper) >= 0 {
+			if i.upper != nil && ((i.cmp(ikey.UserKey, i.upper) >= 0 && !i.upperBoundInclusive) || i.cmp(ikey.UserKey, i.upper) > 0) {
 				i.exhaustedBounds = +1
 				// Next iteration will return.
 			}
@@ -2904,7 +2907,7 @@ func (r *Reader) Close() error {
 // table. If an error occurs, NewIterWithBlockPropertyFilters cleans up after
 // itself and returns a nil iterator.
 func (r *Reader) NewIterWithBlockPropertyFilters(
-	lower, upper []byte,
+	lower, upper []byte, upperBoundInclusive bool,
 	filterer *BlockPropertiesFilterer,
 	useFilterBlock bool,
 	stats *base.InternalIteratorStats,
@@ -2915,7 +2918,7 @@ func (r *Reader) NewIterWithBlockPropertyFilters(
 	// until the final iterator closes.
 	if r.Properties.IndexType == twoLevelIndex {
 		i := twoLevelIterPool.Get().(*twoLevelIterator)
-		err := i.init(r, lower, upper, filterer, useFilterBlock, stats, rp)
+		err := i.init(r, lower, upper, upperBoundInclusive, filterer, useFilterBlock, stats, rp)
 		if err != nil {
 			return nil, err
 		}
@@ -2930,7 +2933,7 @@ func (r *Reader) NewIterWithBlockPropertyFilters(
 	}
 
 	i := singleLevelIterPool.Get().(*singleLevelIterator)
-	err := i.init(r, lower, upper, filterer, useFilterBlock, stats, rp)
+	err := i.init(r, lower, upper, upperBoundInclusive, filterer, useFilterBlock, stats, rp)
 	if err != nil {
 		return nil, err
 	}
@@ -2950,7 +2953,7 @@ func (r *Reader) NewIterWithBlockPropertyFilters(
 // returned from the iter.
 func (r *Reader) NewIter(lower, upper []byte) (Iterator, error) {
 	return r.NewIterWithBlockPropertyFilters(
-		lower, upper, nil, true /* useFilterBlock */, nil, /* stats */
+		lower, upper, false, nil, true /* useFilterBlock */, nil, /* stats */
 		TrivialReaderProvider{Reader: r})
 }
 
@@ -2961,7 +2964,7 @@ func (r *Reader) NewCompactionIter(bytesIterated *uint64, rp ReaderProvider) (It
 	if r.Properties.IndexType == twoLevelIndex {
 		i := twoLevelIterPool.Get().(*twoLevelIterator)
 		err := i.init(
-			r, nil /* lower */, nil /* upper */, nil, false /* useFilter */, nil /* stats */, rp)
+			r, nil /* lower */, nil /* upper */, false, nil, false /* useFilter */, nil /* stats */, rp)
 		if err != nil {
 			return nil, err
 		}
@@ -2980,7 +2983,7 @@ func (r *Reader) NewCompactionIter(bytesIterated *uint64, rp ReaderProvider) (It
 	}
 	i := singleLevelIterPool.Get().(*singleLevelIterator)
 	err := i.init(
-		r, nil /* lower */, nil /* upper */, nil, false /* useFilter */, nil /* stats */, rp)
+		r, nil /* lower */, nil /* upper */, false, nil, false /* useFilter */, nil /* stats */, rp)
 	if err != nil {
 		return nil, err
 	}

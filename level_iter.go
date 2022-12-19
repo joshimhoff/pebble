@@ -516,12 +516,23 @@ func (l *levelIter) findFileLT(key []byte, flags base.SeekLTFlags) *fileMetadata
 // upper bound, and 0 if the table overlaps the iteration bounds.
 func (l *levelIter) initTableBounds(f *fileMetadata) int {
 	l.tableOpts.LowerBound = l.lower
+	l.tableOpts.UpperBoundIsInclusive = false
+	if f.CreatorUniqueID != 0 {
+		// Virtual sstable. Impose bounds.
+		if l.tableOpts.LowerBound == nil || l.cmp(l.tableOpts.LowerBound, f.SmallestPointKey.UserKey) < 0 {
+			l.tableOpts.LowerBound = f.SmallestPointKey.UserKey
+		}
+		if l.tableOpts.UpperBound == nil || l.cmp(l.tableOpts.UpperBound, f.LargestPointKey.UserKey) > 0 {
+			l.tableOpts.UpperBound = f.LargestPointKey.UserKey
+			l.tableOpts.UpperBoundIsInclusive = true
+		}
+	}
 	if l.tableOpts.LowerBound != nil {
 		if l.cmp(f.LargestPointKey.UserKey, l.tableOpts.LowerBound) < 0 {
 			// The largest key in the sstable is smaller than the lower bound.
 			return -1
 		}
-		if l.cmp(l.tableOpts.LowerBound, f.SmallestPointKey.UserKey) <= 0 {
+		if l.cmp(l.tableOpts.LowerBound, f.SmallestPointKey.UserKey) <= 0 && f.CreatorUniqueID == 0 {
 			// The lower bound is smaller or equal to the smallest key in the
 			// table. Iteration within the table does not need to check the lower
 			// bound.
@@ -535,7 +546,7 @@ func (l *levelIter) initTableBounds(f *fileMetadata) int {
 			// bound.
 			return 1
 		}
-		if l.cmp(l.tableOpts.UpperBound, f.LargestPointKey.UserKey) > 0 {
+		if l.cmp(l.tableOpts.UpperBound, f.LargestPointKey.UserKey) > 0 && f.CreatorUniqueID == 0 {
 			// The upper bound is greater than the largest key in the
 			// table. Iteration within the table does not need to check the upper
 			// bound. NB: tableOpts.UpperBound is exclusive and f.LargestPointKey is
@@ -658,6 +669,7 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 				meta := SharedSSTMeta{
 					CreatorUniqueID: file.CreatorUniqueID,
 					PhysicalFileNum: uint64(file.PhysicalFileNum),
+					SourceLevel:     uint8(manifest.LevelToInt(l.level)),
 					Smallest:        smallest,
 					Largest:         largest,
 					FileSmallest:    fileSmallest,

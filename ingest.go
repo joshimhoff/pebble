@@ -17,6 +17,12 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 )
 
+type fileMetadataAndLevel struct {
+	*fileMetadata
+
+	targetLevel int
+}
+
 func sstableKeyCompare(userCmp Compare, a, b InternalKey) int {
 	c := userCmp(a.UserKey, b.UserKey)
 	if c != 0 {
@@ -52,7 +58,7 @@ func ingestLoad1(
 	isShared bool,
 	cacheID uint64,
 	fileNum FileNum,
-) (*fileMetadata, error) {
+) (*fileMetadataAndLevel, error) {
 	if isShared && opts.SharedFS == nil {
 		panic("ingestLoad1: function called with shared meta but DB does not have shared fs")
 	}
@@ -96,11 +102,16 @@ func ingestLoad1(
 	meta.FileNum = fileNum
 	meta.Size = uint64(stat.Size())
 	meta.CreationTime = time.Now().Unix()
+	var targetLevel int
 
 	if isShared {
 		meta.IsShared = true
 		meta.CreatorUniqueID = smeta.CreatorUniqueID
 		meta.PhysicalFileNum = base.FileNum(smeta.PhysicalFileNum)
+		targetLevel = 5
+		if smeta.SourceLevel == 6 {
+			targetLevel = 6
+		}
 		meta.Smallest = base.DecodeInternalKey(smeta.Smallest)
 		meta.Largest = base.DecodeInternalKey(smeta.Largest)
 		meta.FileSmallest = base.DecodeInternalKey(smeta.FileSmallest)
@@ -234,7 +245,7 @@ func ingestLoad1(
 		return nil, err
 	}
 
-	return meta, nil
+	return &fileMetadataAndLevel{fileMetadata: meta, targetLevel: targetLevel}, nil
 }
 
 func ingestLoad(
@@ -244,23 +255,23 @@ func ingestLoad(
 	smeta []SharedSSTMeta,
 	cacheID uint64,
 	pending []FileNum,
-) ([]*fileMetadata, []string, []bool, error) {
+) ([]*fileMetadata, []string, []int, error) {
 	nTables := len(paths)
 	if opts.SharedFS != nil && smeta != nil {
 		nTables += len(smeta)
 	}
 	meta := make([]*fileMetadata, 0, nTables)
 	newPaths := make([]string, 0, nTables)
-	shared := make([]bool, 0, nTables)
+	shared := make([]int, 0, nTables)
 	for i := range paths {
 		m, err := ingestLoad1(opts, fmv, paths[i], SharedSSTMeta{}, false, cacheID, pending[i])
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		if m != nil {
-			meta = append(meta, m)
+			meta = append(meta, m.fileMetadata)
 			newPaths = append(newPaths, paths[i])
-			shared = append(shared, false)
+			shared = append(shared, 0)
 		}
 	}
 	// Handle shared sstable for the len(paths)+1-th to the end of the slice
@@ -273,9 +284,9 @@ func ingestLoad(
 				return nil, nil, nil, err
 			}
 			if m != nil {
-				meta = append(meta, m)
+				meta = append(meta, m.fileMetadata)
 				newPaths = append(newPaths, spath)
-				shared = append(shared, true)
+				shared = append(shared, m.targetLevel)
 			}
 		}
 	}
@@ -288,7 +299,7 @@ func ingestLoad(
 type metaAndPaths struct {
 	meta   []*fileMetadata
 	paths  []string
-	shared []bool
+	shared []int
 	cmp    Compare
 }
 
@@ -306,7 +317,7 @@ func (m metaAndPaths) Swap(i, j int) {
 	m.shared[i], m.shared[j] = m.shared[j], m.shared[i]
 }
 
-func ingestSortAndVerify(cmp Compare, meta []*fileMetadata, paths []string, shared []bool) error {
+func ingestSortAndVerify(cmp Compare, meta []*fileMetadata, paths []string, shared []int) error {
 	if len(meta) <= 1 {
 		return nil
 	}
@@ -319,7 +330,7 @@ func ingestSortAndVerify(cmp Compare, meta []*fileMetadata, paths []string, shar
 	})
 
 	for i := 1; i < len(meta); i++ {
-		if shared[i] || shared[i-1] {
+		if shared[i] != 0 || shared[i-1] != 0 {
 			continue
 		}
 		if sstableKeyCompare(cmp, meta[i-1].Largest, meta[i].Smallest) >= 0 {
@@ -341,7 +352,7 @@ func ingestCleanup(fs vfs.FS, dirname string, meta []*fileMetadata) error {
 }
 
 func ingestLink(
-	jobID int, opts *Options, dirname string, paths []string, meta []*fileMetadata, shared []bool,
+	jobID int, opts *Options, dirname string, paths []string, meta []*fileMetadata, shared []int,
 ) error {
 	// Wrap the normal filesystem with one which wraps newly created files with
 	// vfs.NewSyncingFile.
@@ -355,7 +366,7 @@ func ingestLink(
 
 	for i := range paths {
 		// Nothing to do for shared ssts
-		if shared[i] {
+		if shared[i] != 0 {
 			continue
 		}
 		target := base.MakeFilepath(fs, dirname, fileTypeTable, meta[i].FileNum)
@@ -725,6 +736,7 @@ func ingestTargetLevel(
 type SharedSSTMeta struct {
 	CreatorUniqueID           uint32
 	PhysicalFileNum           uint64
+	SourceLevel               uint8
 	Smallest, Largest         []byte
 	FileSmallest, FileLargest []byte
 }
@@ -778,7 +790,19 @@ func (d *DB) Ingest(paths []string, smeta []SharedSSTMeta) error {
 	if d.opts.ReadOnly {
 		return ErrReadOnly
 	}
-	_, err := d.ingest(paths, smeta, ingestTargetLevel)
+	_, err := d.ingest(paths, smeta, ingestTargetLevel, keyspan.Span{})
+	return err
+}
+
+// IngestAndExcise TODO.
+func (d *DB) IngestAndExcise(paths []string, smeta []SharedSSTMeta, exciseSpan keyspan.Span) error {
+	if err := d.closed.Load(); err != nil {
+		panic(err)
+	}
+	if d.opts.ReadOnly {
+		return ErrReadOnly
+	}
+	_, err := d.ingest(paths, smeta, ingestTargetLevel, exciseSpan)
 	return err
 }
 
@@ -804,7 +828,7 @@ func (d *DB) IngestWithStats(paths []string, smeta []SharedSSTMeta) (IngestOpera
 	if d.opts.ReadOnly {
 		return IngestOperationStats{}, ErrReadOnly
 	}
-	return d.ingest(paths, smeta, ingestTargetLevel)
+	return d.ingest(paths, smeta, ingestTargetLevel, keyspan.Span{})
 }
 
 func sortAndMergeSpans(cmp Compare, spans []keyspan.Span) []keyspan.Span {
@@ -834,7 +858,7 @@ func sortAndMergeSpans(cmp Compare, spans []keyspan.Span) []keyspan.Span {
 }
 
 func (d *DB) ingest(
-	paths []string, smeta []SharedSSTMeta, targetLevelFunc ingestTargetLevelFunc,
+	paths []string, smeta []SharedSSTMeta, targetLevelFunc ingestTargetLevelFunc, exciseSpan keyspan.Span,
 ) (IngestOperationStats, error) {
 	// Allocate file numbers for all of the files being ingested and mark them as
 	// pending in order to prevent them from being deleted. Note that this causes
@@ -878,12 +902,17 @@ func (d *DB) ingest(
 	}
 	sharedSpans := []keyspan.Span{}
 	for i, m := range meta {
-		if !shared[i] {
+		if shared[i] == 0 {
 			continue
 		}
 		sharedSpans = append(sharedSpans, keyspan.Span{Start: m.Smallest.UserKey, End: m.Largest.UserKey})
 	}
 	sharedSpans = sortAndMergeSpans(d.cmp, sharedSpans)
+	for _, span := range sharedSpans {
+		if !exciseSpan.Valid() || d.cmp(span.Start, exciseSpan.Start) < 0 || d.cmp(span.End, exciseSpan.End) > 0 {
+			return IngestOperationStats{}, errors.Newf("ingest: shared span outside of excise span: %s - %s", d.opts.Comparer.FormatKey(span.Start), d.opts.Comparer.FormatKey(span.End))
+		}
+	}
 
 	// Hard link the sstables into the DB directory. Since the sstables aren't
 	// referenced by a version, they won't be used. If the hard linking fails
@@ -951,7 +980,7 @@ func (d *DB) ingest(
 
 		// Assign the sstables to the correct level in the LSM and apply the
 		// version edit.
-		ve, err = d.ingestApply(jobID, meta, targetLevelFunc, sharedSpans)
+		ve, err = d.ingestApply(jobID, meta, targetLevelFunc, exciseSpan, shared)
 	}
 
 	d.commit.AllocateSeqNum(len(meta), prepare, apply)
@@ -964,7 +993,7 @@ func (d *DB) ingest(
 		for i, path := range paths {
 			// No removal for shared ssts
 			// Here the items in paths and meta are matched
-			if shared[i] {
+			if shared[i] != 0 {
 				continue
 			}
 			if err2 := d.opts.FS.Remove(path); err2 != nil {
@@ -1011,7 +1040,7 @@ type ingestTargetLevelFunc func(
 ) (int, error)
 
 func (d *DB) ingestApply(
-	jobID int, meta []*fileMetadata, findTargetLevel ingestTargetLevelFunc, sharedSpans []keyspan.Span,
+	jobID int, meta []*fileMetadata, findTargetLevel ingestTargetLevelFunc, exciseSpan keyspan.Span, targetLevels []int,
 ) (*versionEdit, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1038,13 +1067,20 @@ func (d *DB) ingestApply(
 		m := meta[i]
 		f := &ve.NewFiles[i]
 		var err error
-		f.Level, err = findTargetLevel(d, d.newIters, d.tableNewRangeKeyIter, iterOps, d.cmp, current, baseLevel, d.mu.compact.inProgress, m)
-		if err != nil {
-			d.mu.versions.logUnlock()
-			return nil, err
+		if targetLevels[i] != 0 {
+			// Shared file owned by a different node.
+			f.Level = targetLevels[i]
+		} else {
+			f.Level, err = findTargetLevel(d, d.newIters, d.tableNewRangeKeyIter, iterOps, d.cmp, current, baseLevel, d.mu.compact.inProgress, m)
+			if err != nil {
+				d.mu.versions.logUnlock()
+				return nil, err
+			}
 		}
-		if f.Level >= sharedLevel && d.opts.SharedFS != nil {
+		if f.Level >= sharedLevel && d.opts.SharedFS != nil && targetLevels[i] == 0 {
+			// Shared file owned by us.
 			m.IsShared = true
+			m.CreatorUniqueID = d.opts.UniqueID
 			obsoleteFiles = append(obsoleteFiles, obsoleteFile{
 				dir:         d.dirname,
 				fileNum:     m.FileNum,
@@ -1063,6 +1099,97 @@ func (d *DB) ingestApply(
 		levelMetrics.Size += int64(m.Size)
 		levelMetrics.BytesIngested += m.Size
 		levelMetrics.TablesIngested++
+	}
+	if exciseSpan.Valid() {
+		for level := 0; level < numLevels; level++ {
+			if d.mu.versions.currentVersion().Levels[level].Empty() {
+				continue
+			}
+
+			var filesToExcise []*fileMetadata
+			slice := d.mu.versions.currentVersion().Overlaps(level, d.cmp, exciseSpan.Start, exciseSpan.End, false)
+			sort.Slice(filesToExcise, func(i, j int) bool {
+				return d.cmp(filesToExcise[i].Smallest.UserKey, filesToExcise[j].Smallest.UserKey) < 0
+			})
+			slice.Each(func(meta *manifest.FileMetadata) {
+				filesToExcise = append(filesToExcise, meta)
+			})
+			for _, meta := range filesToExcise {
+				if ve.DeletedFiles == nil {
+					ve.DeletedFiles = map[manifest.DeletedFileEntry]*manifest.FileMetadata{}
+				}
+				ve.DeletedFiles[manifest.DeletedFileEntry{
+					Level:   level,
+					FileNum: meta.FileNum,
+				}] = meta
+				newMeta := &fileMetadata{}
+				*newMeta = *meta
+				newMeta.FileNum = d.mu.versions.getNextFileNum()
+				newMeta.CreatorUniqueID = d.opts.UniqueID
+				newMeta.PhysicalFileNum = meta.FileNum
+				newMeta.FileSmallest = newMeta.Smallest
+				newMeta.FileLargest = newMeta.Largest
+
+				// exciseSpan overlaps with the current file. We need to splice
+				// away [exciseSpan.Start, exciseSpan.End]. Produce up to
+				// two virtual sstables, one with bounds:
+				// [newMeta.FileSmallest, exciseSpan.Start.PrevKeyInSST()]
+				// And another with bounds:
+				// [exciseSpan.End.NextKeyInSST(), newMeta.FileLargest]
+				// If any of the bounds above have no keys in them, or have smallest > largest,
+				// then that sstable does not need to be created. It's also possible
+				// for there to be no virtual sstable created, if the shared sstable span is very wide.
+				newMeta2 := &fileMetadata{}
+				*newMeta2 = *newMeta
+				if d.cmp(exciseSpan.Start, newMeta.FileSmallest.UserKey) > 0 {
+					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{}, internalIterOpts{})
+					if err != nil {
+						return nil, err
+					}
+					if rangeDelIter != nil {
+						if err := rangeDelIter.Close(); err != nil {
+							return nil, err
+						}
+					}
+					ikey, _ := iter.SeekLT(exciseSpan.Start, base.SeekLTFlagsNone)
+					if ikey != nil {
+						newMeta.Largest.UserKey = ikey.Clone().UserKey
+						ve.NewFiles = append(ve.NewFiles, manifest.NewFileEntry{
+							Level: level,
+							Meta:  newMeta,
+						})
+					}
+					if err := iter.Close(); err != nil {
+						return nil, err
+					}
+				}
+				if d.cmp(exciseSpan.End, newMeta.FileLargest.UserKey) < 0 {
+					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{}, internalIterOpts{})
+					if err != nil {
+						return nil, err
+					}
+					if rangeDelIter != nil {
+						if err := rangeDelIter.Close(); err != nil {
+							return nil, err
+						}
+					}
+					ikey, _ := iter.SeekGE(exciseSpan.End, base.SeekGEFlagsNone)
+					for ikey != nil && d.cmp(ikey.UserKey, exciseSpan.End) <= 0 {
+						ikey, _ = iter.Next()
+					}
+					if ikey != nil {
+						newMeta2.Smallest.UserKey = ikey.Clone().UserKey
+						ve.NewFiles = append(ve.NewFiles, manifest.NewFileEntry{
+							Level: level,
+							Meta:  newMeta2,
+						})
+					}
+					if err := iter.Close(); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 	}
 	if err := d.mu.versions.logAndApply(jobID, ve, metrics, false /* forceRotation */, func() []compactionInfo {
 		return d.getInProgressCompactionInfoLocked(nil)

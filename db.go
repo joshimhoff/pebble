@@ -1237,6 +1237,137 @@ func (d *DB) NewIter(o *IterOptions) *Iterator {
 	return d.newIterInternal(nil /* batch */, nil /* snapshot */, o)
 }
 
+func (d *DB) NewInternalIter(o *IterOptions) *InternalIterator {
+	if err := d.closed.Load(); err != nil {
+		panic(err)
+	}
+	if o.rangeKeys() {
+		panic("range keys not supported with newInternalIter")
+	}
+	if o != nil && o.RangeKeyMasking.Suffix != nil && o.KeyTypes != IterKeyTypePointsAndRanges {
+		panic("pebble: range key masking requires IterKeyTypePointsAndRanges")
+	}
+	// Grab and reference the current readState. This prevents the underlying
+	// files in the associated version from being deleted if there is a current
+	// compaction. The readState is unref'd by Iterator.Close().
+	readState := d.loadReadState()
+
+	// Determine the seqnum to read at after grabbing the read state (current and
+	// memtables) above.
+	var seqNum uint64
+	seqNum = atomic.LoadUint64(&d.mu.versions.atomic.visibleSeqNum)
+
+	// Bundle various structures under a single umbrella in order to allocate
+	// them together.
+	buf := iterAllocPool.Get().(*iterAlloc)
+	dbi := &InternalIterator{
+		comparer:        d.opts.Comparer,
+		readState:       readState,
+		alloc:           buf,
+		newIters:        d.newIters,
+		newIterRangeKey: d.tableNewRangeKeyIter,
+		seqNum:          seqNum,
+	}
+	if o != nil {
+		dbi.opts = *o
+	}
+	dbi.opts.logger = d.opts.Logger
+	if d.opts.private.disableLazyCombinedIteration {
+		dbi.opts.disableLazyCombinedIteration = true
+	}
+	return finishInitializingInternalIter(buf, dbi)
+}
+
+func finishInitializingInternalIter(buf *iterAlloc, i *InternalIterator) *InternalIterator {
+	// Short-hand.
+	memtables := i.readState.memtables
+	if i.opts.OnlyReadGuaranteedDurable {
+		memtables = nil
+	} else {
+		// We only need to read from memtables which contain sequence numbers older
+		// than seqNum. Trim off newer memtables.
+		for j := len(memtables) - 1; j >= 0; j-- {
+			if logSeqNum := memtables[j].logSeqNum; logSeqNum < i.seqNum {
+				break
+			}
+			memtables = memtables[:j]
+		}
+	}
+
+	// Merging levels and levels from iterAlloc.
+	mlevels := buf.mlevels[:0]
+	levels := buf.levels[:0]
+
+	// We compute the number of levels needed ahead of time and reallocate a slice if
+	// the array from the iterAlloc isn't large enough. Doing this allocation once
+	// should improve the performance.
+	numMergingLevels := len(memtables)
+	numLevelIters := 0
+
+	current := i.readState.current
+	numMergingLevels += len(current.L0SublevelFiles)
+	numLevelIters += len(current.L0SublevelFiles)
+	for level := 1; level < len(current.Levels); level++ {
+		if current.Levels[level].Empty() {
+			continue
+		}
+		numMergingLevels++
+		numLevelIters++
+	}
+
+	if numMergingLevels > cap(mlevels) {
+		mlevels = make([]mergingIterLevel, 0, numMergingLevels)
+	}
+	if numLevelIters > cap(levels) {
+		levels = make([]levelIter, 0, numLevelIters)
+	}
+
+	// Next are the memtables.
+	for j := len(memtables) - 1; j >= 0; j-- {
+		mem := memtables[j]
+		mlevels = append(mlevels, mergingIterLevel{
+			iter:         mem.newIter(&i.opts),
+			rangeDelIter: mem.newRangeDelIter(&i.opts),
+		})
+	}
+
+	// Next are the file levels: L0 sub-levels followed by lower levels.
+	mlevelsIndex := len(mlevels)
+	levelsIndex := len(levels)
+	mlevels = mlevels[:numMergingLevels]
+	levels = levels[:numLevelIters]
+	addLevelIterForFiles := func(files manifest.LevelIterator, level manifest.Level) {
+		li := &levels[levelsIndex]
+
+		li.init(i.opts, i.comparer.Compare, i.comparer.Split, i.newIters, files, level, internalIterOpts{})
+		li.initRangeDel(&mlevels[mlevelsIndex].rangeDelIter)
+		li.initBoundaryContext(&mlevels[mlevelsIndex].levelIterBoundaryContext)
+		mlevels[mlevelsIndex].iter = li
+
+		levelsIndex++
+		mlevelsIndex++
+	}
+
+	// Add level iterators for the L0 sublevels, iterating from newest to
+	// oldest.
+	for i := len(current.L0SublevelFiles) - 1; i >= 0; i-- {
+		addLevelIterForFiles(current.L0SublevelFiles[i].Iter(), manifest.L0Sublevel(i))
+	}
+
+	// Add level iterators for the non-empty non-L0 levels.
+	for level := 1; level < numLevels; level++ {
+		if current.Levels[level].Empty() {
+			continue
+		}
+		addLevelIterForFiles(current.Levels[level].Iter(), manifest.Level(level))
+	}
+	buf.merging.init(&i.opts, &InternalIteratorStats{}, i.comparer.Compare, i.comparer.Split, mlevels...)
+	buf.merging.snapshot = i.seqNum
+	i.iter = &buf.merging
+
+	return i
+}
+
 // NewSnapshot returns a point-in-time view of the current DB state. Iterators
 // created with this handle will all observe a stable snapshot of the current
 // DB state. The caller must call Snapshot.Close() when the snapshot is no
