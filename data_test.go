@@ -1141,7 +1141,7 @@ func runForceIngestCmd(td *datadriven.TestData, d *DB) error {
 		*fileMetadata,
 	) (int, error) {
 		return level, nil
-	})
+	}, keyspan.Span{})
 	return err
 }
 

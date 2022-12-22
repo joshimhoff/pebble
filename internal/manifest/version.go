@@ -242,6 +242,9 @@ type FileMetadata struct {
 	// This is used in MakeSharedSSTPath
 	CreatorUniqueID uint32
 
+	// IsNowVirtual is flipped if this file becomes virtual.
+	IsNowVirtual bool
+
 	// PhysicalFileNum is the file's file num when it is created
 	// This is used in MakeSharedSSTPath
 	PhysicalFileNum base.FileNum

@@ -281,7 +281,7 @@ func (i *tableIterator) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey
 // First() and Last() are just two synonyms of SeekGE and SeekLT
 
 func (i *tableIterator) First() (*InternalKey, base.LazyValue) {
-	if i.isShared() {
+	if i.isShared() || i.isVirtual() {
 		// in this case the table must have a smallest key
 		return i.seekGEShared(nil, i.getReader().meta.Smallest.UserKey, base.SeekGEFlagsNone)
 	}

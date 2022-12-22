@@ -479,7 +479,7 @@ func (r *Runner) applyWorkloadSteps(ctx context.Context) error {
 				return err
 			}
 		case ingestStepKind:
-			if err := r.d.Ingest(step.tablesToIngest); err != nil {
+			if err := r.d.Ingest(step.tablesToIngest, nil); err != nil {
 				return err
 			}
 

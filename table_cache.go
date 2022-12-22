@@ -966,7 +966,11 @@ func (v *tableCacheValue) load(meta *fileMetadata, c *tableCacheShard, dbOpts *t
 		dirname = dbOpts.sharedDir
 		v.filename = base.MakeSharedSSTPath(fs, dirname, meta.CreatorUniqueID, meta.PhysicalFileNum)
 	} else {
-		v.filename = base.MakeFilepath(fs, dirname, fileTypeTable, meta.FileNum)
+		if meta.PhysicalFileNum != 0 {
+			v.filename = base.MakeFilepath(fs, dirname, fileTypeTable, meta.PhysicalFileNum)
+		} else {
+			v.filename = base.MakeFilepath(fs, dirname, fileTypeTable, meta.FileNum)
+		}
 	}
 	f, v.err = fs.Open(v.filename, vfs.RandomReadsOption)
 	if v.err == nil {

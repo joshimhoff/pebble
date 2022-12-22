@@ -48,6 +48,13 @@ func (s *Snapshot) NewIter(o *IterOptions) *Iterator {
 	return s.db.newIterInternal(nil /* batch */, s, o)
 }
 
+func (s *Snapshot) NewInternalIter(o *IterOptions) *InternalIterator {
+	if s.db == nil {
+		panic(ErrClosed)
+	}
+	return s.db.newInternalIterInternal(s, o)
+}
+
 // Close closes the snapshot, releasing its resources. Close must be called.
 // Failure to do so will result in a tiny memory leak and a large leak of
 // resources on disk due to the entries the snapshot is preventing from being

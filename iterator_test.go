@@ -3063,7 +3063,7 @@ func BenchmarkSeekPrefixTombstones(b *testing.B) {
 			w := sstable.NewWriter(f, wOpts)
 			require.NoError(b, w.DeleteRange(testkeys.Key(ks, i), testkeys.Key(ks, i+1)))
 			require.NoError(b, w.Close())
-			require.NoError(b, d.Ingest([]string{filename}))
+			require.NoError(b, d.Ingest([]string{filename}, nil))
 		}()
 	}
 

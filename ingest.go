@@ -5,6 +5,7 @@
 package pebble
 
 import (
+	"fmt"
 	"sort"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/private"
+	"github.com/cockroachdb/pebble/rangekey"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -391,7 +393,8 @@ func ingestLink(
 			err = vfs.LinkOrCopy(fs, paths[i], target)
 		}
 		if err == nil && opts.SharedFS != nil {
-			sharedTarget := base.MakeSharedSSTPath(opts.SharedFS, opts.SharedDir, opts.UniqueID, meta[i].PhysicalFileNum)
+			sharedTarget := base.MakeSharedSSTPath(opts.SharedFS, opts.SharedDir, meta[i].CreatorUniqueID, meta[i].PhysicalFileNum)
+			opts.SharedFS.MkdirAll(opts.SharedFS.PathDir(sharedTarget), 0755)
 			err = vfs.CopyAcrossFS(fs, paths[i], opts.SharedFS, sharedTarget)
 		}
 		if err != nil {
@@ -413,13 +416,18 @@ func ingestLink(
 	return nil
 }
 
-func ingestMemtableOverlaps(cmp Compare, mem flushable, meta []*fileMetadata) bool {
+func ingestMemtableOverlaps(cmp Compare, mem flushable, meta []*fileMetadata, exciseSpan keyspan.Span) bool {
 	iter := mem.newIter(nil)
 	rangeDelIter := mem.newRangeDelIter(nil)
 	rkeyIter := mem.newRangeKeyIter(nil)
 
 	for _, m := range meta {
 		if overlapWithIterator(iter, &rangeDelIter, rkeyIter, m, cmp) {
+			return true
+		}
+	}
+	if exciseSpan.Valid() {
+		if overlapWithIterator(iter, &rangeDelIter, rkeyIter, &fileMetadata{Smallest: InternalKey{UserKey: exciseSpan.Start}, Largest: InternalKey{UserKey: exciseSpan.End}}, cmp) {
 			return true
 		}
 	}
@@ -795,7 +803,7 @@ func (d *DB) Ingest(paths []string, smeta []SharedSSTMeta) error {
 }
 
 // IngestAndExcise TODO.
-func (d *DB) IngestAndExcise(paths []string, smeta []SharedSSTMeta, exciseSpan keyspan.Span) error {
+func (d *DB) IngestAndExcise(paths []string, smeta []SharedSSTMeta, exciseSpan rangekey.Span) error {
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
@@ -943,7 +951,7 @@ func (d *DB) ingest(
 		// overlaps.
 		for i := len(d.mu.mem.queue) - 1; i >= 0; i-- {
 			m := d.mu.mem.queue[i]
-			if ingestMemtableOverlaps(d.cmp, m, meta) {
+			if ingestMemtableOverlaps(d.cmp, m, meta, exciseSpan) {
 				mem = m
 				if mem.flushable == d.mu.mem.mutable {
 					err = d.makeRoomForWrite(nil)
@@ -980,7 +988,7 @@ func (d *DB) ingest(
 
 		// Assign the sstables to the correct level in the LSM and apply the
 		// version edit.
-		ve, err = d.ingestApply(jobID, meta, targetLevelFunc, exciseSpan, shared)
+		ve, err = d.ingestApply(jobID, meta, targetLevelFunc, exciseSpan, shared, seqNum)
 	}
 
 	d.commit.AllocateSeqNum(len(meta), prepare, apply)
@@ -1040,10 +1048,33 @@ type ingestTargetLevelFunc func(
 ) (int, error)
 
 func (d *DB) ingestApply(
-	jobID int, meta []*fileMetadata, findTargetLevel ingestTargetLevelFunc, exciseSpan keyspan.Span, targetLevels []int,
+	jobID int, meta []*fileMetadata, findTargetLevel ingestTargetLevelFunc, exciseSpan keyspan.Span, targetLevels []int, seqNum uint64,
 ) (*versionEdit, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	if exciseSpan.Valid() {
+		for {
+			foundCompacting := false
+			for level := 0; level < numLevels; level++ {
+				if d.mu.versions.currentVersion().Levels[level].Empty() {
+					continue
+				}
+
+				slice := d.mu.versions.currentVersion().Overlaps(level, d.cmp, exciseSpan.Start, exciseSpan.End, true)
+				slice.Each(func(metadata *manifest.FileMetadata) {
+					if metadata.IsCompacting() {
+						foundCompacting = true
+						d.mu.compact.cond.Wait()
+					}
+				})
+			}
+			if !foundCompacting {
+				break
+			}
+		}
+	}
+	d.mu.compact.excisedSpan = append(d.mu.compact.excisedSpan, excisedSpan{span: exciseSpan, seqNum: seqNum})
 
 	ve := &versionEdit{
 		NewFiles: make([]newFileEntry, len(meta)),
@@ -1057,6 +1088,7 @@ func (d *DB) ingestApply(
 	// logAndApply unconditionally releases the manifest lock, but any earlier
 	// returns must unlock the manifest.
 	d.mu.versions.logLock()
+
 	current := d.mu.versions.currentVersion()
 	baseLevel := d.mu.versions.picker.getBaseLevel()
 	iterOps := IterOptions{logger: d.opts.Logger}
@@ -1070,7 +1102,9 @@ func (d *DB) ingestApply(
 		if targetLevels[i] != 0 {
 			// Shared file owned by a different node.
 			f.Level = targetLevels[i]
+			fmt.Printf("file %d, targetLevel = %d\n", meta[i].FileNum, f.Level)
 		} else {
+			fmt.Printf("file %d, targetLevel not found\n", meta[i].FileNum)
 			f.Level, err = findTargetLevel(d, d.newIters, d.tableNewRangeKeyIter, iterOps, d.cmp, current, baseLevel, d.mu.compact.inProgress, m)
 			if err != nil {
 				d.mu.versions.logUnlock()
@@ -1081,6 +1115,8 @@ func (d *DB) ingestApply(
 			// Shared file owned by us.
 			m.IsShared = true
 			m.CreatorUniqueID = d.opts.UniqueID
+			m.FileSmallest = m.Smallest
+			m.FileLargest = m.Largest
 			obsoleteFiles = append(obsoleteFiles, obsoleteFile{
 				dir:         d.dirname,
 				fileNum:     m.FileNum,
@@ -1107,7 +1143,7 @@ func (d *DB) ingestApply(
 			}
 
 			var filesToExcise []*fileMetadata
-			slice := d.mu.versions.currentVersion().Overlaps(level, d.cmp, exciseSpan.Start, exciseSpan.End, false)
+			slice := d.mu.versions.currentVersion().Overlaps(level, d.cmp, exciseSpan.Start, exciseSpan.End, true)
 			sort.Slice(filesToExcise, func(i, j int) bool {
 				return d.cmp(filesToExcise[i].Smallest.UserKey, filesToExcise[j].Smallest.UserKey) < 0
 			})
@@ -1126,7 +1162,11 @@ func (d *DB) ingestApply(
 				*newMeta = *meta
 				newMeta.FileNum = d.mu.versions.getNextFileNum()
 				newMeta.CreatorUniqueID = d.opts.UniqueID
-				newMeta.PhysicalFileNum = meta.FileNum
+				if meta.PhysicalFileNum != 0 {
+					newMeta.PhysicalFileNum = meta.PhysicalFileNum
+				} else {
+					newMeta.PhysicalFileNum = meta.FileNum
+				}
 				newMeta.FileSmallest = newMeta.Smallest
 				newMeta.FileLargest = newMeta.Largest
 
@@ -1141,6 +1181,7 @@ func (d *DB) ingestApply(
 				// for there to be no virtual sstable created, if the shared sstable span is very wide.
 				newMeta2 := &fileMetadata{}
 				*newMeta2 = *newMeta
+				newMeta2.FileNum = d.mu.versions.getNextFileNum()
 				if d.cmp(exciseSpan.Start, newMeta.FileSmallest.UserKey) > 0 {
 					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{}, internalIterOpts{})
 					if err != nil {
@@ -1152,8 +1193,24 @@ func (d *DB) ingestApply(
 						}
 					}
 					ikey, _ := iter.SeekLT(exciseSpan.Start, base.SeekLTFlagsNone)
+					found := false
 					if ikey != nil {
 						newMeta.Largest.UserKey = ikey.Clone().UserKey
+						newMeta.LargestPointKey.UserKey = newMeta.Largest.UserKey
+						found = true
+					}
+					if newMeta.HasRangeKeys {
+						if d.cmp(newMeta.LargestRangeKey.UserKey, exciseSpan.Start) >= 0 {
+							newMeta.HasRangeKeys = false
+							newMeta.SmallestRangeKey = InternalKey{}
+							newMeta.LargestRangeKey = InternalKey{}
+						} else if base.InternalCompare(d.cmp, newMeta.Largest, newMeta.LargestRangeKey) < 0 {
+							newMeta.Largest = newMeta.LargestRangeKey
+							found = true
+						}
+					}
+					if found {
+						meta.IsNowVirtual = true
 						ve.NewFiles = append(ve.NewFiles, manifest.NewFileEntry{
 							Level: level,
 							Meta:  newMeta,
@@ -1174,11 +1231,24 @@ func (d *DB) ingestApply(
 						}
 					}
 					ikey, _ := iter.SeekGE(exciseSpan.End, base.SeekGEFlagsNone)
-					for ikey != nil && d.cmp(ikey.UserKey, exciseSpan.End) <= 0 {
-						ikey, _ = iter.Next()
-					}
+					found := false
 					if ikey != nil {
 						newMeta2.Smallest.UserKey = ikey.Clone().UserKey
+						newMeta2.SmallestPointKey.UserKey = newMeta2.Smallest.UserKey
+						found = true
+					}
+					if newMeta2.HasRangeKeys {
+						if d.cmp(newMeta2.SmallestRangeKey.UserKey, exciseSpan.End) < 0 {
+							newMeta2.HasRangeKeys = false
+							newMeta2.SmallestRangeKey = InternalKey{}
+							newMeta2.LargestRangeKey = InternalKey{}
+						} else if base.InternalCompare(d.cmp, newMeta2.Smallest, newMeta2.SmallestRangeKey) > 0 {
+							newMeta2.Smallest = newMeta2.SmallestRangeKey
+							found = true
+						}
+					}
+					if found {
+						meta.IsNowVirtual = true
 						ve.NewFiles = append(ve.NewFiles, manifest.NewFileEntry{
 							Level: level,
 							Meta:  newMeta2,

@@ -452,6 +452,10 @@ func (b *Batch) Get(key []byte) ([]byte, io.Closer, error) {
 	return b.db.getInternal(key, b, nil /* snapshot */)
 }
 
+func (b *Batch) NewInternalIter(o *IterOptions) *InternalIterator {
+	panic("unsupported")
+}
+
 func (b *Batch) prepareDeferredKeyValueRecord(keyLen, valueLen int, kind InternalKeyKind) {
 	if len(b.data) == 0 {
 		b.init(keyLen + valueLen + 2*binary.MaxVarintLen64 + batchHeaderLen)
@@ -560,6 +564,26 @@ func (b *Batch) SetDeferred(keyLen, valueLen int) *DeferredBatchOp {
 	b.prepareDeferredKeyValueRecord(keyLen, valueLen, InternalKeyKindSet)
 	b.deferredOp.index = b.index
 	return &b.deferredOp
+}
+
+// AddInternalKey TODO
+func (b *Batch) AddInternalKey(key InternalKey, value []byte, _ *WriteOptions) error {
+	if key.Kind() == InternalKeyKindDelete || key.Kind() == InternalKeyKindSingleDelete {
+		b.prepareDeferredKeyRecord(len(key.UserKey), key.Kind())
+		b.deferredOp.index = b.index
+		copy(b.deferredOp.Key, key.UserKey)
+	} else {
+		b.prepareDeferredKeyValueRecord(len(key.UserKey), len(value), key.Kind())
+		b.deferredOp.index = b.index
+		copy(b.deferredOp.Key, key.UserKey)
+		copy(b.deferredOp.Value, value)
+	}
+	if b.index != nil {
+		if err := b.index.Add(b.deferredOp.offset); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Merge adds an action to the batch that merges the value at key with the new

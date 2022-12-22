@@ -242,7 +242,7 @@ func TestIngestSortAndVerify(t *testing.T) {
 				var buf bytes.Buffer
 				var meta []*fileMetadata
 				var paths []string
-				var shared []bool
+				var shared []int
 				var cmpName string
 				d.ScanArgs(t, "cmp", &cmpName)
 				cmp := comparers[cmpName]
@@ -262,7 +262,7 @@ func TestIngestSortAndVerify(t *testing.T) {
 					m := (&fileMetadata{}).ExtendPointKeyBounds(cmp, smallest, largest)
 					meta = append(meta, m)
 					paths = append(paths, strconv.Itoa(i))
-					shared = append(shared, false)
+					shared = append(shared, 0)
 				}
 				err := ingestSortAndVerify(cmp, meta, paths, shared)
 				if err != nil {
@@ -296,7 +296,7 @@ func TestIngestLink(t *testing.T) {
 			paths := make([]string, 10)
 			meta := make([]*fileMetadata, len(paths))
 			contents := make([][]byte, len(paths))
-			shared := make([]bool, len(paths))
+			shared := make([]int, len(paths))
 			for j := range paths {
 				paths[j] = fmt.Sprintf("external%d", j)
 				meta[j] = &fileMetadata{}
@@ -311,7 +311,7 @@ func TestIngestLink(t *testing.T) {
 				require.NoError(t, err)
 				require.NoError(t, f.Close())
 
-				shared[j] = false
+				shared[j] = 0
 			}
 
 			if i < count {
@@ -378,7 +378,7 @@ func TestIngestLinkFallback(t *testing.T) {
 	opts.EnsureDefaults()
 
 	meta := []*fileMetadata{{FileNum: 1}}
-	require.NoError(t, ingestLink(0, opts, "", []string{"source"}, meta, []bool{false}))
+	require.NoError(t, ingestLink(0, opts, "", []string{"source"}, meta, []int{0}))
 
 	dest, err := mem.Open("000001.sst")
 	require.NoError(t, err)

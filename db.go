@@ -70,6 +70,8 @@ type Reader interface {
 	// SeekLT, First or Last.
 	NewIter(o *IterOptions) *Iterator
 
+	NewInternalIter(o *IterOptions) *InternalIterator
+
 	// Close closes the Reader. It may or may not close any underlying io.Reader
 	// or io.Writer, depending on how the DB was created.
 	//
@@ -202,6 +204,11 @@ func (d defaultCPUWorkGranter) GetPermission(_ time.Duration) CPUWorkHandle {
 }
 
 func (d defaultCPUWorkGranter) CPUWorkDone(_ CPUWorkHandle) {}
+
+type excisedSpan struct {
+	span   keyspan.Span
+	seqNum uint64
+}
 
 // DB provides a concurrent, persistent ordered key/value store.
 //
@@ -411,6 +418,8 @@ type DB struct {
 			manual []*manualCompaction
 			// inProgress is the set of in-progress flushes and compactions.
 			inProgress map[*compaction]struct{}
+			// exciseSpan is the set of spans being excised right now.
+			excisedSpan []excisedSpan
 
 			// rescheduleReadCompaction indicates to an iterator that a read compaction
 			// should be scheduled.
@@ -1238,6 +1247,10 @@ func (d *DB) NewIter(o *IterOptions) *Iterator {
 }
 
 func (d *DB) NewInternalIter(o *IterOptions) *InternalIterator {
+	return d.newInternalIterInternal(nil /* snapshot */, o)
+}
+
+func (d *DB) newInternalIterInternal(s *Snapshot, o *IterOptions) *InternalIterator {
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
@@ -1255,7 +1268,11 @@ func (d *DB) NewInternalIter(o *IterOptions) *InternalIterator {
 	// Determine the seqnum to read at after grabbing the read state (current and
 	// memtables) above.
 	var seqNum uint64
-	seqNum = atomic.LoadUint64(&d.mu.versions.atomic.visibleSeqNum)
+	if s == nil {
+		seqNum = atomic.LoadUint64(&d.mu.versions.atomic.visibleSeqNum)
+	} else {
+		seqNum = s.seqNum
+	}
 
 	// Bundle various structures under a single umbrella in order to allocate
 	// them together.
@@ -1557,7 +1574,7 @@ func (d *DB) Compact(start, end []byte, parallelize bool) error {
 		// overlaps.
 		for i := len(d.mu.mem.queue) - 1; i >= 0; i-- {
 			mem := d.mu.mem.queue[i]
-			if ingestMemtableOverlaps(d.cmp, mem, meta) {
+			if ingestMemtableOverlaps(d.cmp, mem, meta, keyspan.Span{}) {
 				var err error
 				if mem.flushable == d.mu.mem.mutable {
 					// We have to hold both commitPipeline.mu and DB.mu when calling

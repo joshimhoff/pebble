@@ -2201,6 +2201,18 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 
 	ve, pendingOutputs, err := d.runCompaction(jobID, c)
 
+	for _, e := range d.mu.compact.excisedSpan {
+		for _, l := range c.inputs {
+			l.files.Each(func(meta *manifest.FileMetadata) {
+				if d.cmp(e.span.Start, meta.Largest.UserKey) <= 0 && d.cmp(e.span.End, meta.Smallest.UserKey) > 0 {
+					if meta.SmallestSeqNum < e.seqNum {
+						err = errors.New("erroring compaction due to overlap with excised span")
+					}
+				}
+			})
+		}
+	}
+
 	info.Duration = d.timeNow().Sub(startTime)
 	if err == nil {
 		d.mu.versions.logLock()
@@ -2331,7 +2343,7 @@ func (d *DB) runCompaction(
 	// such a move if there is lots of overlapping grandparent data. Otherwise,
 	// the move could create a parent file that will require a very expensive
 	// merge later on.
-	if c.kind == compactionKindMove {
+	if c.kind == compactionKindMove && d.opts.SharedFS == nil {
 		iter := c.startLevel.files.Iter()
 		meta := iter.First()
 		c.metrics = map[int]*LevelMetrics{
@@ -2686,7 +2698,7 @@ func (d *DB) runCompaction(
 
 		// If the output SSTable falls in lower levels than sharedLevel, it will be moved to the shared
 		// file system asynchronously
-		if d.opts.SharedFS != nil && c.outputLevel.level >= sharedLevel && !writerMeta.HasRangeKeys {
+		if d.opts.SharedFS != nil && c.outputLevel.level >= sharedLevel {
 			//if writerMeta.HasRangeKeys {
 			//	panic("runCompaction: shared sst does not support range keys")
 			//}
@@ -2695,12 +2707,16 @@ func (d *DB) runCompaction(
 
 			oldFilename := base.MakeFilepath(d.opts.FS, d.dirname, fileTypeTable, meta.FileNum)
 			sharedFilename := base.MakeSharedSSTPath(d.opts.SharedFS, d.opts.SharedDir, meta.CreatorUniqueID, meta.PhysicalFileNum)
+			d.opts.SharedFS.MkdirAll(d.opts.SharedFS.PathDir(sharedFilename), 0755)
+
 			movers.Add(1)
 			go func() {
 				defer movers.Done()
-				if err := moveFileToSharedFS(oldFilename, d.opts.FS, sharedFilename, d.opts.SharedFS); err == nil {
-					meta.IsShared = true
+				if err := moveFileToSharedFS(oldFilename, d.opts.FS, sharedFilename, d.opts.SharedFS); err != nil {
+					fmt.Printf("error: %s\n", err)
+					return
 				}
+				meta.IsShared = true
 			}()
 		}
 
@@ -3148,6 +3164,9 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 			// is local or foreign
 			physicalFileNum = table.PhysicalFileNum
 			creatorUniqueID = table.CreatorUniqueID
+		}
+		if table.IsNowVirtual {
+			continue
 		}
 		obsoleteTables = append(obsoleteTables, fileInfo{
 			fileNum:         table.FileNum,

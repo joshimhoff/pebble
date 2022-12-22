@@ -171,19 +171,19 @@ type InternalIterator struct {
 	seqNum          uint64
 }
 
-func (i *InternalIterator) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, LazyValue) {
-	return i.iter.SeekGE(key, flags)
+func (i *InternalIterator) SeekGE(key []byte) (*InternalKey, LazyValue) {
+	return i.iter.SeekGE(key, base.SeekGEFlagsNone)
 }
 
-func (i *InternalIterator) First() (*base.InternalKey, base.LazyValue) {
+func (i *InternalIterator) First() (*InternalKey, LazyValue) {
 	return i.iter.First()
 }
 
-func (i *InternalIterator) Next() (*base.InternalKey, base.LazyValue) {
+func (i *InternalIterator) Next() (*InternalKey, LazyValue) {
 	return i.iter.Next()
 }
 
-func (i *InternalIterator) Prev() (*base.InternalKey, base.LazyValue) {
+func (i *InternalIterator) Prev() (*InternalKey, LazyValue) {
 	return i.iter.Prev()
 }
 

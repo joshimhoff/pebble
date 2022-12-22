@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
@@ -251,30 +253,9 @@ func TestIngestSharedSST(t *testing.T) {
 	t.Logf("Exporting keys in range %s to %s (inclusive) from d1 and ingest to d2", startkey, endkey)
 
 	var smeta []SharedSSTMeta
-	cb := func(meta *manifest.FileMetadata) {
-		// If no overlap, just return
-		if d1.cmp(meta.Smallest.UserKey, endkey) > 0 || d1.cmp(meta.Largest.UserKey, startkey) < 0 {
-			return
-		}
+	cb := func(meta SharedSSTMeta) {
 
-		lk := meta.Smallest.UserKey
-		if d1.cmp(meta.Smallest.UserKey, startkey) < 0 {
-			lk = startkey
-		}
-		hk := meta.Largest.UserKey
-		if d1.cmp(meta.Largest.UserKey, endkey) > 0 {
-			hk = endkey
-		}
-
-		m := SharedSSTMeta{
-			CreatorUniqueID: meta.CreatorUniqueID,
-			PhysicalFileNum: meta.PhysicalFileNum,
-			Smallest:        base.MakeInternalKey(lk, 0, InternalKeyKindMax),
-			Largest:         base.MakeInternalKey(hk, 0, InternalKeyKindMax),
-			FileSmallest:    meta.FileSmallest,
-			FileLargest:     meta.FileLargest,
-		}
-		smeta = append(smeta, m)
+		smeta = append(smeta, meta)
 	}
 
 	f, err := fs1.Create("export")
@@ -356,4 +337,202 @@ func TestIngestSharedSST(t *testing.T) {
 
 	require.NoError(t, d1.Close())
 	require.NoError(t, d2.Close())
+}
+
+type testingLogger struct {
+	t       *testing.T
+	wrapped Logger
+}
+
+func (t testingLogger) Infof(format string, args ...interface{}) {
+	t.t.Logf(format, args...)
+	t.wrapped.Infof(format, args...)
+}
+
+func (t testingLogger) Fatalf(format string, args ...interface{}) {
+	t.t.Logf(format, args...)
+	t.wrapped.Fatalf(format, args...)
+}
+
+var _ Logger = &testingLogger{}
+
+func TestDisaggIngest(t *testing.T) {
+	rand.Seed(time.Now().Unix())
+
+	uid1 := uint32(rand.Uint32()) + 1
+	uid2 := uint32(rand.Uint32()) + 2
+	tempDir := t.TempDir()
+
+	fs := vfs.Default
+	dir1 := fs.PathJoin(tempDir, "fs1")
+	dir2 := fs.PathJoin(tempDir, "fs2")
+	sharedDir := fs.PathJoin(tempDir, "shared")
+
+	logger := DefaultLogger
+	el := MakeLoggingEventListener(logger)
+	t.Log("Creating two Pebble instances d1 and d2")
+	d1, err := Open(dir1, &Options{
+		FS:        fs,
+		SharedFS:  fs,
+		SharedDir: sharedDir,
+		UniqueID:  uid1,
+		Levels: []LevelOptions{
+			{TargetFileSize: 2048},
+		},
+		EventListener: &el,
+		Logger:        logger,
+	})
+	require.NoError(t, err)
+
+	d2, err := Open(dir2, &Options{
+		FS:        fs,
+		SharedFS:  fs,
+		SharedDir: sharedDir,
+		UniqueID:  uid2,
+		Levels: []LevelOptions{
+			{TargetFileSize: 2048},
+		},
+		EventListener: &el,
+		Logger:        logger,
+	})
+	require.NoError(t, err)
+
+	keys := testkeys.Alpha(2)
+	keys1 := keys.EveryN(rand.Intn(3) + 1)
+	value := bytes.Repeat([]byte("x"), 256)
+	value2 := bytes.Repeat([]byte("y"), 128)
+	value3 := bytes.Repeat([]byte("z"), 64)
+
+	d1.Set(testkeys.Key(keys1, 0), []byte("zzzz"), nil)
+	d1.Set(testkeys.Key(keys1, keys1.Count()-1), []byte("zzzz"), nil)
+	d1.Flush()
+	d1.Compact(testkeys.Key(keys1, 0), testkeys.Key(keys1, keys1.Count()-1), false)
+
+	// repeatly inserting/updating a random key
+	for i := 0; i < keys1.Count(); i++ {
+		key := testkeys.Key(keys1, i)
+		if err := d1.Set(key, value, nil); err != nil {
+			t.Fatalf("set key %s error %v", key, err)
+		}
+	}
+	d1.Flush()
+	d1.Compact(testkeys.Key(keys1, 0), testkeys.Key(keys1, keys1.Count()-1), false)
+
+	for i := 0; i < keys1.Count(); i++ {
+		if rand.Intn(3) != 0 {
+			continue
+		}
+		key := testkeys.Key(keys1, i)
+		if err := d1.Set(key, value3, nil); err != nil {
+			t.Fatalf("set key %s error %v", key, err)
+		}
+	}
+	d1.Flush()
+
+	keys2 := keys.EveryN(rand.Intn(3) + 1)
+	for i := 0; i < keys2.Count(); i++ {
+		key := testkeys.Key(keys2, i)
+		if err := d2.Set(key, value2, nil); err != nil {
+			t.Fatalf("set key %s error %v", key, err)
+		}
+	}
+	d2.Flush()
+
+	t.Logf("Printing d1 LSM")
+	printLevels(t, d1)
+	t.Logf("Printing d2 LSM")
+	printLevels(t, d2)
+
+	// exporting a range
+	startIdx := rand.Intn(keys1.Count() / 2)
+	endIdx := startIdx + rand.Intn(keys1.Count()-startIdx)
+	startKey := testkeys.Key(keys1, startIdx)
+	endKey := testkeys.Key(keys1, endIdx)
+	t.Logf("Exporting keys in range %s to %s (inclusive) from d1 and ingest to d2", startKey, endKey)
+
+	var smeta []SharedSSTMeta
+	fileNums := map[uint64]struct{}{}
+	cb := func(meta SharedSSTMeta) {
+		if _, ok := fileNums[meta.PhysicalFileNum]; ok {
+			return
+		}
+		fileNums[meta.PhysicalFileNum] = struct{}{}
+		smeta = append(smeta, meta)
+	}
+
+	err = fs.MkdirAll(fs.PathJoin(dir1, "export"), 0755)
+	require.NoError(t, err)
+	exportedSSTPath := fs.PathJoin(dir1, "export", "one.sst")
+	f, err := fs.Create(exportedSSTPath)
+	require.NoError(t, err)
+	w := sstable.NewWriter(f, sstable.WriterOptions{})
+
+	iterOpts := &IterOptions{SkipSharedFile: true, SharedFileCallback: cb}
+	iterOpts.LowerBound = startKey
+	iterOpts.UpperBound = endKey
+	iter := d1.NewInternalIter(iterOpts)
+	require.NotEqual(t, nil, iter)
+	gotKeys := false
+	for ikey, val := iter.SeekGE(startKey, base.SeekGEFlagsNone); ikey != nil && testkeys.Comparer.Compare(ikey.UserKey, endKey) < 0; ikey, val = iter.Next() {
+		ikeyToAdd := ikey.Clone()
+		ikeyToAdd.SetSeqNum(0)
+		if err := w.Add(ikeyToAdd, val.InPlaceValue()); err != nil {
+			t.Fatal(err)
+		}
+		gotKeys = true
+	}
+	require.NoError(t, iter.Close())
+	require.NoError(t, f.Sync())
+	require.NoError(t, w.Close())
+	if len(smeta) == 0 {
+		t.Fatalf("got no shared files")
+	}
+	t.Logf("got local keys: %v", gotKeys)
+	require.NoError(t, d2.IngestAndExcise(nil, smeta, keyspan.Span{Start: startKey, End: endKey}))
+	if gotKeys {
+		require.NoError(t, d2.Ingest([]string{exportedSSTPath}, nil))
+		t.Logf("ingested local: %v", exportedSSTPath)
+	}
+
+	t.Logf("Verifying key visibility by iterating over d2's key space")
+
+	iter1 := d1.NewIter(&IterOptions{LowerBound: startKey, UpperBound: endKey, KeyTypes: IterKeyTypePointsOnly})
+	require.NotNil(t, iter1)
+	iter2 := d2.NewIter(&IterOptions{LowerBound: startKey, UpperBound: endKey, KeyTypes: IterKeyTypePointsOnly})
+	require.NotNil(t, iter2)
+	iter2.SeekGE(startKey)
+	for valid := iter1.SeekGE(startKey); valid; valid = iter1.Next() {
+		require.Equal(t, iter1.Valid(), iter2.Valid())
+		require.Equal(t, iter1.Key(), iter2.Key(), "keys mismatch")
+		val1, err := iter1.ValueAndErr()
+		val2, err2 := iter2.ValueAndErr()
+		require.NoError(t, err)
+		require.NoError(t, err2)
+		require.Equal(t, val1, val2, "values mismatch")
+		iter2.Next()
+	}
+	require.NoError(t, iter1.Close())
+	require.NoError(t, iter2.Close())
+
+	// Print out the contents in the directories
+	t.Logf("Printing d1 local files (.sst only):")
+	list, err := fs.List(dir1)
+	require.NoError(t, err)
+	for i := range list {
+		if strings.HasSuffix(list[i], ".sst") {
+			t.Logf("  - %s", list[i])
+		}
+	}
+
+	t.Logf("Printing d2 local files (.sst only):")
+	list, err = fs.List(dir2)
+	require.NoError(t, err)
+	for i := range list {
+		if strings.HasSuffix(list[i], ".sst") {
+			t.Logf("  - %s", list[i])
+		}
+	}
+
+	_ = d1.Close()
+	_ = d2.Close()
 }

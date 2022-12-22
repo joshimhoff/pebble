@@ -746,6 +746,9 @@ func (vs *versionSet) addLiveFileNums(m map[FileNum]struct{}) {
 			iter := lm.Iter()
 			for f := iter.First(); f != nil; f = iter.Next() {
 				m[f.FileNum] = struct{}{}
+				if f.PhysicalFileNum != 0 {
+					m[f.PhysicalFileNum] = struct{}{}
+				}
 			}
 		}
 		if v == current {
