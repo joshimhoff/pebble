@@ -206,8 +206,8 @@ func (d defaultCPUWorkGranter) GetPermission(_ time.Duration) CPUWorkHandle {
 func (d defaultCPUWorkGranter) CPUWorkDone(_ CPUWorkHandle) {}
 
 type excisedSpan struct {
-	span   keyspan.Span
-	seqNum uint64
+	span       keyspan.Span
+	curFileNum base.FileNum
 }
 
 // DB provides a concurrent, persistent ordered key/value store.

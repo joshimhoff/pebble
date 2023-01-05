@@ -1053,28 +1053,9 @@ func (d *DB) ingestApply(
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if exciseSpan.Valid() {
-		for {
-			foundCompacting := false
-			for level := 0; level < numLevels; level++ {
-				if d.mu.versions.currentVersion().Levels[level].Empty() {
-					continue
-				}
-
-				slice := d.mu.versions.currentVersion().Overlaps(level, d.cmp, exciseSpan.Start, exciseSpan.End, true)
-				slice.Each(func(metadata *manifest.FileMetadata) {
-					if metadata.IsCompacting() {
-						foundCompacting = true
-						d.mu.compact.cond.Wait()
-					}
-				})
-			}
-			if !foundCompacting {
-				break
-			}
-		}
+	if exciseSpan.Valid() && len(meta) > 0 {
+		d.mu.compact.excisedSpan = append(d.mu.compact.excisedSpan, excisedSpan{span: exciseSpan, curFileNum: meta[0].FileNum})
 	}
-	d.mu.compact.excisedSpan = append(d.mu.compact.excisedSpan, excisedSpan{span: exciseSpan, seqNum: seqNum})
 
 	ve := &versionEdit{
 		NewFiles: make([]newFileEntry, len(meta)),
@@ -1137,6 +1118,7 @@ func (d *DB) ingestApply(
 		levelMetrics.TablesIngested++
 	}
 	if exciseSpan.Valid() {
+		fmt.Printf("excising span %s - %s\n", d.opts.Comparer.FormatKey(exciseSpan.Start), d.opts.Comparer.FormatKey(exciseSpan.End))
 		for level := 0; level < numLevels; level++ {
 			if d.mu.versions.currentVersion().Levels[level].Empty() {
 				continue
@@ -1158,6 +1140,7 @@ func (d *DB) ingestApply(
 					Level:   level,
 					FileNum: meta.FileNum,
 				}] = meta
+				fmt.Printf("deleting file %s as part of excise\n", meta.FileNum)
 				newMeta := &fileMetadata{}
 				*newMeta = *meta
 				newMeta.FileNum = d.mu.versions.getNextFileNum()
@@ -1167,23 +1150,21 @@ func (d *DB) ingestApply(
 				} else {
 					newMeta.PhysicalFileNum = meta.FileNum
 				}
-				newMeta.FileSmallest = newMeta.Smallest
-				newMeta.FileLargest = newMeta.Largest
 
 				// exciseSpan overlaps with the current file. We need to splice
 				// away [exciseSpan.Start, exciseSpan.End]. Produce up to
 				// two virtual sstables, one with bounds:
-				// [newMeta.FileSmallest, exciseSpan.Start.PrevKeyInSST()]
+				// [oldMeta.Smallest, exciseSpan.Start.PrevKeyInSST()]
 				// And another with bounds:
-				// [exciseSpan.End.NextKeyInSST(), newMeta.FileLargest]
+				// [exciseSpan.End.NextKeyInSST(), oldMeta.Largest]
 				// If any of the bounds above have no keys in them, or have smallest > largest,
 				// then that sstable does not need to be created. It's also possible
 				// for there to be no virtual sstable created, if the shared sstable span is very wide.
 				newMeta2 := &fileMetadata{}
 				*newMeta2 = *newMeta
 				newMeta2.FileNum = d.mu.versions.getNextFileNum()
-				if d.cmp(exciseSpan.Start, newMeta.FileSmallest.UserKey) > 0 {
-					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{}, internalIterOpts{})
+				if d.cmp(exciseSpan.Start, newMeta.Smallest.UserKey) > 0 {
+					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{LowerBound: meta.Smallest.UserKey, UpperBound: meta.Largest.UserKey}, internalIterOpts{})
 					if err != nil {
 						return nil, err
 					}
@@ -1220,8 +1201,8 @@ func (d *DB) ingestApply(
 						return nil, err
 					}
 				}
-				if d.cmp(exciseSpan.End, newMeta.FileLargest.UserKey) < 0 {
-					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{}, internalIterOpts{})
+				if d.cmp(exciseSpan.End, newMeta2.Largest.UserKey) < 0 {
+					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{LowerBound: meta.Smallest.UserKey, UpperBound: meta.Largest.UserKey}, internalIterOpts{})
 					if err != nil {
 						return nil, err
 					}

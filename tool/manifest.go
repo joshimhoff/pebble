@@ -124,6 +124,12 @@ func (m *manifestT) printLevels(cmp base.Compare, stdout io.Writer, v *manifest.
 			fmt.Fprintf(stdout, "  %s:%d", f.FileNum, f.Size)
 			formatSeqNumRange(stdout, f.SmallestSeqNum, f.LargestSeqNum)
 			formatKeyRange(stdout, m.fmtKey, &f.Smallest, &f.Largest)
+			if f.IsShared {
+				fmt.Fprintf(stdout, "<shared>")
+			}
+			if f.CreatorUniqueID != 0 {
+				fmt.Fprintf(stdout, "<virtual: creator=%d, physical=%d>", f.CreatorUniqueID, f.PhysicalFileNum)
+			}
 			fmt.Fprintf(stdout, "\n")
 		}
 	}

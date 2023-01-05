@@ -2205,8 +2205,8 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 		for _, l := range c.inputs {
 			l.files.Each(func(meta *manifest.FileMetadata) {
 				if d.cmp(e.span.Start, meta.Largest.UserKey) <= 0 && d.cmp(e.span.End, meta.Smallest.UserKey) > 0 {
-					if meta.SmallestSeqNum < e.seqNum {
-						err = errors.New("erroring compaction due to overlap with excised span")
+					if meta.FileNum < e.curFileNum {
+						err = errors.Newf("erroring compaction due to overlap with excised span: %s - %s", c.formatKey(e.span.Start), c.formatKey(e.span.End))
 					}
 				}
 			})

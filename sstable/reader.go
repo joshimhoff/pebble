@@ -2929,7 +2929,7 @@ func (r *Reader) NewIterWithBlockPropertyFilters(
 			}
 			return nil, err
 		}
-		return &tableIterator{i, rangeDelIter}, nil
+		return &tableIterator{Iterator: i, rangeDelIter: rangeDelIter}, nil
 	}
 
 	i := singleLevelIterPool.Get().(*singleLevelIterator)
@@ -2944,7 +2944,7 @@ func (r *Reader) NewIterWithBlockPropertyFilters(
 		}
 		return nil, err
 	}
-	return &tableIterator{i, rangeDelIter}, nil
+	return &tableIterator{Iterator: i, rangeDelIter: rangeDelIter}, nil
 }
 
 // NewIter returns an iterator for the contents of the table. If an error
@@ -2977,7 +2977,7 @@ func (r *Reader) NewCompactionIter(bytesIterated *uint64, rp ReaderProvider) (It
 			return nil, err
 		}
 		return &twoLevelCompactionIterator{
-			tableIterator: &tableIterator{i, rangeDelIter},
+			tableIterator: &tableIterator{Iterator: i, rangeDelIter: rangeDelIter},
 			bytesIterated: bytesIterated,
 		}, nil
 	}
@@ -2996,7 +2996,7 @@ func (r *Reader) NewCompactionIter(bytesIterated *uint64, rp ReaderProvider) (It
 		return nil, err
 	}
 	return &compactionIterator{
-		tableIterator: &tableIterator{i, rangeDelIter},
+		tableIterator: &tableIterator{Iterator: i, rangeDelIter: rangeDelIter},
 		bytesIterated: bytesIterated,
 	}, nil
 }
