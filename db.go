@@ -1185,7 +1185,7 @@ func (i *Iterator) constructPointIter(memtables flushableList, buf *iterAlloc) {
 	addLevelIterForFiles := func(files manifest.LevelIterator, level manifest.Level) {
 		li := &levels[levelsIndex]
 
-		li.init(i.opts, i.comparer.Compare, i.comparer.Split, i.newIters, files, level, internalOpts)
+		li.init(i.opts, i.comparer.Compare, i.comparer.Split, i.comparer.FormatKey, i.newIters, files, level, internalOpts)
 		li.initRangeDel(&mlevels[mlevelsIndex].rangeDelIter)
 		li.initBoundaryContext(&mlevels[mlevelsIndex].levelIterBoundaryContext)
 		li.initCombinedIterState(&i.lazyCombinedIter.combinedIterState)
@@ -1356,7 +1356,7 @@ func finishInitializingInternalIter(buf *iterAlloc, i *InternalIterator) *Intern
 	addLevelIterForFiles := func(files manifest.LevelIterator, level manifest.Level) {
 		li := &levels[levelsIndex]
 
-		li.init(i.opts, i.comparer.Compare, i.comparer.Split, i.newIters, files, level, internalIterOpts{})
+		li.init(i.opts, i.comparer.Compare, i.comparer.Split, i.comparer.FormatKey, i.newIters, files, level, internalIterOpts{})
 		li.initRangeDel(&mlevels[mlevelsIndex].rangeDelIter)
 		li.initBoundaryContext(&mlevels[mlevelsIndex].levelIterBoundaryContext)
 		mlevels[mlevelsIndex].iter = li

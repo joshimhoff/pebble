@@ -6,6 +6,7 @@ package pebble
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -1054,7 +1055,13 @@ func (d *DB) ingestApply(
 	defer d.mu.Unlock()
 
 	if exciseSpan.Valid() && len(meta) > 0 {
-		d.mu.compact.excisedSpan = append(d.mu.compact.excisedSpan, excisedSpan{span: exciseSpan, curFileNum: meta[0].FileNum})
+		minFileNum := uint64(math.MaxUint64)
+		for _, m := range meta {
+			if uint64(m.FileNum) < minFileNum {
+				minFileNum = uint64(m.FileNum)
+			}
+		}
+		d.mu.compact.excisedSpan = append(d.mu.compact.excisedSpan, excisedSpan{span: exciseSpan, curFileNum: base.FileNum(minFileNum)})
 	}
 
 	ve := &versionEdit{
@@ -1133,6 +1140,11 @@ func (d *DB) ingestApply(
 				filesToExcise = append(filesToExcise, meta)
 			})
 			for _, meta := range filesToExcise {
+				if d.cmp(meta.Largest.UserKey, exciseSpan.Start) < 0 ||
+					(d.cmp(meta.Largest.UserKey, exciseSpan.Start) == 0 && meta.Largest.IsExclusiveSentinel()) ||
+					d.cmp(meta.Smallest.UserKey, exciseSpan.End) > 0 {
+					continue
+				}
 				if ve.DeletedFiles == nil {
 					ve.DeletedFiles = map[manifest.DeletedFileEntry]*manifest.FileMetadata{}
 				}
@@ -1143,6 +1155,9 @@ func (d *DB) ingestApply(
 				fmt.Printf("deleting file %s as part of excise\n", meta.FileNum)
 				newMeta := &fileMetadata{}
 				*newMeta = *meta
+				meta.IsExcised = true
+				newMeta.CompactionState = manifest.CompactionStateNotCompacting
+				newMeta.IsIntraL0Compacting = false
 				newMeta.FileNum = d.mu.versions.getNextFileNum()
 				newMeta.CreatorUniqueID = d.opts.UniqueID
 				if meta.PhysicalFileNum != 0 {
@@ -1164,14 +1179,9 @@ func (d *DB) ingestApply(
 				*newMeta2 = *newMeta
 				newMeta2.FileNum = d.mu.versions.getNextFileNum()
 				if d.cmp(exciseSpan.Start, newMeta.Smallest.UserKey) > 0 {
-					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{LowerBound: meta.Smallest.UserKey, UpperBound: meta.Largest.UserKey}, internalIterOpts{})
+					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{LowerBound: meta.Smallest.UserKey, UpperBound: meta.Largest.UserKey, UpperBoundIsInclusive: true}, internalIterOpts{})
 					if err != nil {
 						return nil, err
-					}
-					if rangeDelIter != nil {
-						if err := rangeDelIter.Close(); err != nil {
-							return nil, err
-						}
 					}
 					ikey, _ := iter.SeekLT(exciseSpan.Start, base.SeekLTFlagsNone)
 					found := false
@@ -1179,6 +1189,21 @@ func (d *DB) ingestApply(
 						newMeta.Largest.UserKey = ikey.Clone().UserKey
 						newMeta.LargestPointKey.UserKey = newMeta.Largest.UserKey
 						found = true
+					}
+					if rangeDelIter != nil {
+						rdel := rangeDelIter.SeekLT(exciseSpan.Start)
+						if rdel != nil && (!found || d.cmp(rdel.End, newMeta.Largest.UserKey) > 0) {
+							newMeta.Largest.UserKey = append([]byte(nil), rdel.End...)
+							newMeta.Largest.Trailer = InternalKeyRangeDeleteSentinel
+							newMeta.LargestPointKey = newMeta.Largest
+							found = true
+						}
+					}
+					if found {
+						if d.cmp(newMeta.Smallest.UserKey, newMeta.Largest.UserKey) == 0 && base.InternalCompare(d.cmp, newMeta.Smallest, newMeta.Largest) > 0 {
+							newMeta.Largest.Trailer = ikey.Trailer
+							newMeta.LargestPointKey.Trailer = ikey.Trailer
+						}
 					}
 					if newMeta.HasRangeKeys {
 						if d.cmp(newMeta.LargestRangeKey.UserKey, exciseSpan.Start) >= 0 {
@@ -1197,19 +1222,19 @@ func (d *DB) ingestApply(
 							Meta:  newMeta,
 						})
 					}
-					if err := iter.Close(); err != nil {
-						return nil, err
-					}
-				}
-				if d.cmp(exciseSpan.End, newMeta2.Largest.UserKey) < 0 {
-					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{LowerBound: meta.Smallest.UserKey, UpperBound: meta.Largest.UserKey}, internalIterOpts{})
-					if err != nil {
-						return nil, err
-					}
 					if rangeDelIter != nil {
 						if err := rangeDelIter.Close(); err != nil {
 							return nil, err
 						}
+					}
+					if err := iter.Close(); err != nil {
+						return nil, err
+					}
+				}
+				if d.cmp(exciseSpan.End, newMeta2.Largest.UserKey) <= 0 {
+					iter, rangeDelIter, err := d.newIters(meta, &IterOptions{LowerBound: meta.Smallest.UserKey, UpperBound: meta.Largest.UserKey, UpperBoundIsInclusive: true}, internalIterOpts{})
+					if err != nil {
+						return nil, err
 					}
 					ikey, _ := iter.SeekGE(exciseSpan.End, base.SeekGEFlagsNone)
 					found := false
@@ -1217,6 +1242,20 @@ func (d *DB) ingestApply(
 						newMeta2.Smallest.UserKey = ikey.Clone().UserKey
 						newMeta2.SmallestPointKey.UserKey = newMeta2.Smallest.UserKey
 						found = true
+					}
+					if rangeDelIter != nil {
+						rdel := rangeDelIter.SeekGE(exciseSpan.End)
+						if rdel != nil && (!found || d.cmp(rdel.Start, newMeta2.Smallest.UserKey) < 0) {
+							newMeta2.Smallest.UserKey = append([]byte(nil), rdel.Start...)
+							newMeta2.SmallestPointKey = newMeta2.Smallest
+							found = true
+						}
+					}
+					if found {
+						if d.cmp(newMeta2.Smallest.UserKey, newMeta2.Largest.UserKey) == 0 && base.InternalCompare(d.cmp, newMeta2.Smallest, newMeta2.Largest) > 0 {
+							newMeta2.Smallest.Trailer = ikey.Trailer
+							newMeta2.SmallestPointKey.Trailer = ikey.Trailer
+						}
 					}
 					if newMeta2.HasRangeKeys {
 						if d.cmp(newMeta2.SmallestRangeKey.UserKey, exciseSpan.End) < 0 {
@@ -1237,6 +1276,11 @@ func (d *DB) ingestApply(
 					}
 					if err := iter.Close(); err != nil {
 						return nil, err
+					}
+					if rangeDelIter != nil {
+						if err := rangeDelIter.Close(); err != nil {
+							return nil, err
+						}
 					}
 				}
 			}

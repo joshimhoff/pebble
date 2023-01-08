@@ -24,23 +24,15 @@ const (
 type tableIterator struct {
 	Iterator
 	rangeDelIter keyspan.FragmentIterator
-	invalidated  bool
+	reader       *Reader
+	invalidated  int
 }
 
 // NOTE: The physical layout of user keys follows the descending order of freshness
 //       (e.g., newer versions precede older versions)
 
 func (i *tableIterator) getReader() *Reader {
-	var r *Reader
-	switch i.Iterator.(type) {
-	case *twoLevelIterator:
-		r = i.Iterator.(*twoLevelIterator).reader
-	case *singleLevelIterator:
-		r = i.Iterator.(*singleLevelIterator).reader
-	default:
-		panic("tableIterator: i.Iterator is not singleLevelIterator or twoLevelIterator")
-	}
-	return r
+	return i.reader
 }
 
 func (i *tableIterator) getCmp() Compare {
@@ -130,6 +122,13 @@ func (i *tableIterator) setExhaustedBounds(e int8) {
 	}
 }
 
+func (i *tableIterator) SetUpperBoundInclusive(upperBoundInclusive bool) {
+	type upperBoundInclusiveSetter interface {
+		SetUpperBoundInclusive(upperBoundInclusive bool)
+	}
+	i.Iterator.(upperBoundInclusiveSetter).SetUpperBoundInclusive(upperBoundInclusive)
+}
+
 func (i *tableIterator) getCurrUserKey() InternalKey {
 	var k InternalKey
 	switch i.Iterator.(type) {
@@ -153,7 +152,7 @@ func (i *tableIterator) isKeyDeleted(k *InternalKey) bool {
 	// check rangeDel in the same sstable
 	if i.rangeDelIter != nil {
 		cmp := i.getCmp()
-		span := keyspan.SeekGE(cmp, i.rangeDelIter, k.UserKey)
+		span := i.rangeDelIter.SeekGE(k.UserKey)
 		if span != nil && span.Contains(cmp, k.UserKey) && span.Covers(k.SeqNum()) {
 			return true
 		}
@@ -219,7 +218,7 @@ func (i *tableIterator) seekGEShared(
 }
 
 func (i *tableIterator) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, base.LazyValue) {
-	i.invalidated = false
+	i.invalidated = 0
 	// shared path
 	if i.isForeign() {
 		return i.seekGEShared(nil, key, flags)
@@ -228,7 +227,7 @@ func (i *tableIterator) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey
 		if cmp(i.getReader().meta.Smallest.UserKey, key) > 0 {
 			return i.Iterator.SeekGE(i.getReader().meta.Smallest.UserKey, flags)
 		} else if cmp(i.getReader().meta.Largest.UserKey, key) < 0 {
-			i.invalidated = true
+			i.invalidated = +1
 			return nil, base.LazyValue{}
 		}
 	}
@@ -240,7 +239,7 @@ func (i *tableIterator) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey
 func (i *tableIterator) SeekPrefixGE(
 	prefix, key []byte, flags base.SeekGEFlags,
 ) (*InternalKey, base.LazyValue) {
-	i.invalidated = false
+	i.invalidated = 0
 	if i.isForeign() {
 		return i.seekGEShared(prefix, key, flags)
 	} else if i.isVirtual() {
@@ -248,7 +247,7 @@ func (i *tableIterator) SeekPrefixGE(
 		if cmp(i.getReader().meta.Smallest.UserKey, key) > 0 {
 			return i.Iterator.SeekGE(i.getReader().meta.Smallest.UserKey, flags)
 		} else if cmp(i.getReader().meta.Largest.UserKey, key) < 0 {
-			i.invalidated = true
+			i.invalidated = +1
 			return nil, base.LazyValue{}
 		}
 	}
@@ -299,14 +298,14 @@ func (i *tableIterator) seekLTShared(key []byte, flags base.SeekLTFlags) (*Inter
 }
 
 func (i *tableIterator) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey, base.LazyValue) {
-	i.invalidated = false
+	i.invalidated = 0
 	// shared path
 	if i.isForeign() {
 		return i.seekLTShared(key, flags)
 	} else if i.isVirtual() {
 		cmp := i.getCmp()
 		if cmp(i.getReader().meta.Smallest.UserKey, key) > 0 {
-			i.invalidated = true
+			i.invalidated = -1
 			return nil, base.LazyValue{}
 		} else if cmp(i.getReader().meta.Largest.UserKey, key) < 0 {
 			k, v := i.Iterator.SeekLT(i.getReader().meta.Largest.UserKey, base.SeekLTFlagsNone)
@@ -326,7 +325,7 @@ func (i *tableIterator) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey
 // First() and Last() are just two synonyms of SeekGE and SeekLT
 
 func (i *tableIterator) First() (*InternalKey, base.LazyValue) {
-	i.invalidated = false
+	i.invalidated = 0
 	if i.isForeign() {
 		// in this case the table must have a smallest key
 		return i.seekGEShared(nil, i.getReader().meta.Smallest.UserKey, base.SeekGEFlagsNone)
@@ -337,7 +336,7 @@ func (i *tableIterator) First() (*InternalKey, base.LazyValue) {
 }
 
 func (i *tableIterator) Last() (*InternalKey, base.LazyValue) {
-	i.invalidated = false
+	i.invalidated = 0
 	if i.isShared() && !i.isLocallyCreated() {
 		// This case is also tricky.. we should pass in the key which is tightly larger
 		// than the table's largest key to reuse seekLT..
@@ -400,8 +399,12 @@ func (i *tableIterator) nextShared() (*InternalKey, base.LazyValue) {
 }
 
 func (i *tableIterator) Next() (*InternalKey, base.LazyValue) {
-	if i.invalidated {
+	if i.invalidated > 0 {
 		return nil, base.LazyValue{}
+	}
+	if i.invalidated < 0 {
+		i.invalidated = 0
+		return i.First()
 	}
 	if i.isForeign() {
 		return i.nextShared()
@@ -445,8 +448,12 @@ func (i *tableIterator) prevShared() (*InternalKey, base.LazyValue) {
 }
 
 func (i *tableIterator) Prev() (*InternalKey, base.LazyValue) {
-	if i.invalidated {
+	if i.invalidated < 0 {
 		return nil, base.LazyValue{}
+	}
+	if i.invalidated > 0 {
+		i.invalidated = 0
+		return i.Last()
 	}
 	if i.isForeign() {
 		return i.prevShared()

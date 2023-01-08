@@ -306,10 +306,7 @@ func (v *VersionEdit) Decode(r io.Reader) error {
 						if len(field) != 1 {
 							return base.CorruptionErrorf("new-file4: is-shared field wrong size")
 						}
-						if field[0] != 1 {
-							return base.CorruptionErrorf("new-file4: is-shared field tag found but value is not true")
-						}
-						isShared = true
+						isShared = field[0] == 1
 
 						creatorUniqueID, err = d.readUvarint()
 						if err != nil {
@@ -376,10 +373,12 @@ func (v *VersionEdit) Decode(r io.Reader) error {
 			}
 			m.boundsSet = true
 			m.IsShared = isShared
-			if isShared {
-				m.CreatorUniqueID = uint32(creatorUniqueID)
-				m.PhysicalFileNum = base.FileNum(physicalFileNum)
+			m.CreatorUniqueID = uint32(creatorUniqueID)
+			m.PhysicalFileNum = base.FileNum(physicalFileNum)
+			if len(fileSmallest) > 0 {
 				m.FileSmallest = base.DecodeInternalKey(fileSmallest)
+			}
+			if len(fileLargest) > 0 {
 				m.FileLargest = base.DecodeInternalKey(fileLargest)
 			}
 			v.NewFiles = append(v.NewFiles, NewFileEntry{
@@ -490,9 +489,13 @@ func (v *VersionEdit) Encode(w io.Writer) error {
 				e.writeUvarint(customTagNeedsCompaction)
 				e.writeBytes([]byte{1})
 			}
-			if x.Meta.IsShared {
+			if x.Meta.IsShared || x.Meta.CreatorUniqueID != 0 || x.Meta.PhysicalFileNum != 0 {
 				e.writeUvarint(customTagIsShared)
-				e.writeBytes([]byte{1})
+				if x.Meta.IsShared {
+					e.writeBytes([]byte{1})
+				} else {
+					e.writeBytes([]byte{0})
+				}
 				e.writeUvarint(uint64(x.Meta.CreatorUniqueID))
 				e.writeUvarint(uint64(x.Meta.PhysicalFileNum))
 				e.writeKey(x.Meta.FileSmallest)

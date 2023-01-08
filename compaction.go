@@ -1470,7 +1470,7 @@ func (d *DB) removeInProgressCompaction(c *compaction, rollback bool) {
 				// On success all compactions other than move-compactions transition the
 				// file into the Compacted state. Move-compacted files become eligible
 				// for compaction again and transition back to NotCompacting.
-				if c.kind != compactionKindMove {
+				if c.kind != compactionKindMove || d.opts.SharedFS != nil {
 					f.SetCompactionState(manifest.CompactionStateCompacted)
 				} else {
 					f.SetCompactionState(manifest.CompactionStateNotCompacting)
@@ -2198,8 +2198,10 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 	info := c.makeInfo(jobID)
 	d.opts.EventListener.CompactionBegin(info)
 	startTime := d.timeNow()
+	rs := d.loadReadState()
 
 	ve, pendingOutputs, err := d.runCompaction(jobID, c)
+	rs.unrefLocked()
 
 	for _, e := range d.mu.compact.excisedSpan {
 		for _, l := range c.inputs {
@@ -2216,13 +2218,31 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 	info.Duration = d.timeNow().Sub(startTime)
 	if err == nil {
 		d.mu.versions.logLock()
-		err = d.mu.versions.logAndApply(jobID, ve, c.metrics, false /* forceRotation */, func() []compactionInfo {
-			return d.getInProgressCompactionInfoLocked(c)
-		})
-		if err != nil {
-			// TODO(peter): untested.
-			d.mu.versions.obsoleteTables = append(d.mu.versions.obsoleteTables, pendingOutputs...)
-			d.mu.versions.incrementObsoleteTablesLocked(pendingOutputs)
+		for _, l := range c.inputs {
+			l.files.Each(func(meta *manifest.FileMetadata) {
+				for _, e := range d.mu.compact.excisedSpan {
+					if d.cmp(e.span.Start, meta.Largest.UserKey) <= 0 && d.cmp(e.span.End, meta.Smallest.UserKey) > 0 {
+						if meta.FileNum < e.curFileNum {
+							err = errors.Newf("erroring compaction due to overlap with excised span: %s - %s", c.formatKey(e.span.Start), c.formatKey(e.span.End))
+						}
+					}
+				}
+				if meta.IsExcised {
+					err = errors.Newf("erroring compaction due to file %s getting excised", meta.FileNum)
+				}
+			})
+		}
+		if err == nil {
+			err = d.mu.versions.logAndApply(jobID, ve, c.metrics, false /* forceRotation */, func() []compactionInfo {
+				return d.getInProgressCompactionInfoLocked(c)
+			})
+			if err != nil {
+				// TODO(peter): untested.
+				d.mu.versions.obsoleteTables = append(d.mu.versions.obsoleteTables, pendingOutputs...)
+				d.mu.versions.incrementObsoleteTablesLocked(pendingOutputs)
+			}
+		} else {
+			d.mu.versions.logUnlock()
 		}
 	}
 

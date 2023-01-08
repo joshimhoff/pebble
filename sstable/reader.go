@@ -686,7 +686,7 @@ func (i *singleLevelIterator) trySeekGEUsingNextWithinBlock(
 	for j := 0; j < numStepsBeforeSeek; j++ {
 		curKeyCmp := i.cmp(k.UserKey, key)
 		if curKeyCmp >= 0 {
-			if i.blockUpper != nil && i.cmp(k.UserKey, i.blockUpper) >= 0 {
+			if i.blockUpper != nil && ((i.cmp(k.UserKey, i.blockUpper) >= 0 && !i.upperBoundInclusive) || i.cmp(k.UserKey, i.blockUpper) > 0) {
 				i.exhaustedBounds = +1
 				return nil, base.LazyValue{}, true
 			}
@@ -835,7 +835,7 @@ func (i *singleLevelIterator) seekGEHelper(
 				less = i.cmp(currKey.UserKey, key) < 0
 			}
 			if !less {
-				if i.blockUpper != nil && i.cmp(currKey.UserKey, i.blockUpper) >= 0 {
+				if i.blockUpper != nil && ((i.cmp(currKey.UserKey, i.blockUpper) >= 0 && !i.upperBoundInclusive) || i.cmp(currKey.UserKey, i.blockUpper) > 0) {
 					i.exhaustedBounds = +1
 					return nil, base.LazyValue{}
 				}
@@ -878,7 +878,7 @@ func (i *singleLevelIterator) seekGEHelper(
 	}
 	if !dontSeekWithinBlock {
 		if ikey, val := i.data.SeekGE(key, flags.DisableTrySeekUsingNext()); ikey != nil {
-			if i.blockUpper != nil && i.cmp(ikey.UserKey, i.blockUpper) >= 0 {
+			if i.blockUpper != nil && ((i.cmp(ikey.UserKey, i.blockUpper) >= 0 && !i.upperBoundInclusive) || i.cmp(ikey.UserKey, i.blockUpper) > 0) {
 				i.exhaustedBounds = +1
 				return nil, base.LazyValue{}
 			}
@@ -1100,7 +1100,7 @@ func (i *singleLevelIterator) firstInternal() (*InternalKey, base.LazyValue) {
 	}
 	if result == loadBlockOK {
 		if ikey, val := i.data.First(); ikey != nil {
-			if i.blockUpper != nil && i.cmp(ikey.UserKey, i.blockUpper) >= 0 {
+			if i.blockUpper != nil && ((i.cmp(ikey.UserKey, i.blockUpper) >= 0 && !i.upperBoundInclusive) || i.cmp(ikey.UserKey, i.blockUpper) > 0) {
 				i.exhaustedBounds = +1
 				return nil, base.LazyValue{}
 			}
@@ -1197,7 +1197,7 @@ func (i *singleLevelIterator) Next() (*InternalKey, base.LazyValue) {
 		return nil, base.LazyValue{}
 	}
 	if key, val := i.data.Next(); key != nil {
-		if i.blockUpper != nil && i.cmp(key.UserKey, i.blockUpper) >= 0 {
+		if i.blockUpper != nil && ((i.cmp(key.UserKey, i.blockUpper) >= 0 && !i.upperBoundInclusive) || i.cmp(key.UserKey, i.blockUpper) > 0) {
 			i.exhaustedBounds = +1
 			return nil, base.LazyValue{}
 		}
@@ -1219,7 +1219,7 @@ func (i *singleLevelIterator) NextPrefix(succKey []byte) (*InternalKey, base.Laz
 		return nil, base.LazyValue{}
 	}
 	if key, val := i.data.nextPrefix(succKey); key != nil {
-		if i.blockUpper != nil && i.cmp(key.UserKey, i.blockUpper) >= 0 {
+		if i.blockUpper != nil && ((i.cmp(key.UserKey, i.blockUpper) >= 0 && !i.upperBoundInclusive) || i.cmp(key.UserKey, i.blockUpper) > 0) {
 			i.exhaustedBounds = +1
 			return nil, base.LazyValue{}
 		}
@@ -1256,12 +1256,12 @@ func (i *singleLevelIterator) NextPrefix(succKey []byte) (*InternalKey, base.Laz
 		// the next block starts with keys >= ikey.UserKey since even
 		// though this is the block separator, the same user key can span
 		// multiple blocks. Since upper is exclusive we use >= below.
-		if i.upper != nil && i.cmp(ikey.UserKey, i.upper) >= 0 {
+		if i.upper != nil && ((i.cmp(ikey.UserKey, i.upper) >= 0 && !i.upperBoundInclusive) || i.cmp(ikey.UserKey, i.upper) > 0) {
 			i.exhaustedBounds = +1
 			return nil, base.LazyValue{}
 		}
 	} else if key, val := i.data.SeekGE(succKey, base.SeekGEFlagsNone); key != nil {
-		if i.blockUpper != nil && i.cmp(key.UserKey, i.blockUpper) >= 0 {
+		if i.blockUpper != nil && ((i.cmp(key.UserKey, i.blockUpper) >= 0 && !i.upperBoundInclusive) || i.cmp(key.UserKey, i.blockUpper) > 0) {
 			i.exhaustedBounds = +1
 			return nil, base.LazyValue{}
 		}
@@ -1325,7 +1325,7 @@ func (i *singleLevelIterator) skipForward() (*InternalKey, base.LazyValue) {
 			continue
 		}
 		if key, val := i.data.First(); key != nil {
-			if i.blockUpper != nil && i.cmp(key.UserKey, i.blockUpper) >= 0 {
+			if i.blockUpper != nil && ((i.cmp(key.UserKey, i.blockUpper) >= 0 && !i.upperBoundInclusive) || i.cmp(key.UserKey, i.blockUpper) > 0) {
 				i.exhaustedBounds = +1
 				return nil, base.LazyValue{}
 			}
@@ -1462,7 +1462,7 @@ func disableBoundsOpt(bound []byte, ptr uintptr) bool {
 // package.
 func (i *singleLevelIterator) SetBounds(lower, upper []byte) {
 	i.boundsCmp = 0
-	if i.positionedUsingLatestBounds {
+	if i.positionedUsingLatestBounds && !i.upperBoundInclusive {
 		if i.upper != nil && lower != nil && i.cmp(i.upper, lower) <= 0 {
 			i.boundsCmp = +1
 			if invariants.Enabled && disableBoundsOpt(lower, uintptr(unsafe.Pointer(i))) {
@@ -1480,6 +1480,10 @@ func (i *singleLevelIterator) SetBounds(lower, upper []byte) {
 	i.upper = upper
 	i.blockLower = nil
 	i.blockUpper = nil
+}
+
+func (i *singleLevelIterator) SetUpperBoundInclusive(upperBoundInclusive bool) {
+	i.upperBoundInclusive = upperBoundInclusive
 }
 
 var _ base.InternalIterator = &singleLevelIterator{}
@@ -2286,7 +2290,7 @@ func (i *twoLevelIterator) NextPrefix(succKey []byte) (*InternalKey, base.LazyVa
 		// Note that the next entry starts with keys >= ikey.UserKey since even
 		// though this is the block separator, the same user key can span multiple
 		// index blocks. Since upper is exclusive we use >= below.
-		if i.upper != nil && i.cmp(ikey.UserKey, i.upper) >= 0 {
+		if i.upper != nil && ((i.cmp(ikey.UserKey, i.upper) >= 0 && !i.upperBoundInclusive) || i.cmp(ikey.UserKey, i.upper) > 0) {
 			i.exhaustedBounds = +1
 		}
 	} else if key, val := i.singleLevelIterator.SeekGE(succKey, base.SeekGEFlagsNone); key != nil {
@@ -2929,7 +2933,7 @@ func (r *Reader) NewIterWithBlockPropertyFilters(
 			}
 			return nil, err
 		}
-		return &tableIterator{Iterator: i, rangeDelIter: rangeDelIter}, nil
+		return &tableIterator{Iterator: i, rangeDelIter: rangeDelIter, reader: r}, nil
 	}
 
 	i := singleLevelIterPool.Get().(*singleLevelIterator)
@@ -2944,7 +2948,7 @@ func (r *Reader) NewIterWithBlockPropertyFilters(
 		}
 		return nil, err
 	}
-	return &tableIterator{Iterator: i, rangeDelIter: rangeDelIter}, nil
+	return &tableIterator{Iterator: i, rangeDelIter: rangeDelIter, reader: r}, nil
 }
 
 // NewIter returns an iterator for the contents of the table. If an error
@@ -2960,11 +2964,11 @@ func (r *Reader) NewIter(lower, upper []byte) (Iterator, error) {
 // NewCompactionIter returns an iterator similar to NewIter but it also increments
 // the number of bytes iterated. If an error occurs, NewCompactionIter cleans up
 // after itself and returns a nil iterator.
-func (r *Reader) NewCompactionIter(bytesIterated *uint64, rp ReaderProvider) (Iterator, error) {
+func (r *Reader) NewCompactionIter(lower, upper []byte, bytesIterated *uint64, rp ReaderProvider) (Iterator, error) {
 	if r.Properties.IndexType == twoLevelIndex {
 		i := twoLevelIterPool.Get().(*twoLevelIterator)
 		err := i.init(
-			r, nil /* lower */, nil /* upper */, false, nil, false /* useFilter */, nil /* stats */, rp)
+			r, lower /* lower */, upper /* upper */, upper != nil, nil, false /* useFilter */, nil /* stats */, rp)
 		if err != nil {
 			return nil, err
 		}
@@ -2977,13 +2981,13 @@ func (r *Reader) NewCompactionIter(bytesIterated *uint64, rp ReaderProvider) (It
 			return nil, err
 		}
 		return &twoLevelCompactionIterator{
-			tableIterator: &tableIterator{Iterator: i, rangeDelIter: rangeDelIter},
+			tableIterator: &tableIterator{Iterator: i, rangeDelIter: rangeDelIter, reader: r},
 			bytesIterated: bytesIterated,
 		}, nil
 	}
 	i := singleLevelIterPool.Get().(*singleLevelIterator)
 	err := i.init(
-		r, nil /* lower */, nil /* upper */, false, nil, false /* useFilter */, nil /* stats */, rp)
+		r, lower /* lower */, upper /* upper */, upper != nil, nil, false /* useFilter */, nil /* stats */, rp)
 	if err != nil {
 		return nil, err
 	}
@@ -2996,7 +3000,7 @@ func (r *Reader) NewCompactionIter(bytesIterated *uint64, rp ReaderProvider) (It
 		return nil, err
 	}
 	return &compactionIterator{
-		tableIterator: &tableIterator{Iterator: i, rangeDelIter: rangeDelIter},
+		tableIterator: &tableIterator{Iterator: i, rangeDelIter: rangeDelIter, reader: r},
 		bytesIterated: bytesIterated,
 	}, nil
 }

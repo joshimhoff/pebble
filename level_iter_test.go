@@ -420,7 +420,7 @@ func TestLevelIterSeek(t *testing.T) {
 			slice := manifest.NewLevelSliceKeySorted(lt.cmp.Compare, lt.metas)
 			iter := &levelIterTestIter{levelIter: &levelIter{}}
 			iter.init(IterOptions{}, DefaultComparer.Compare,
-				func(a []byte) int { return len(a) }, lt.newIters, slice.Iter(),
+				func(a []byte) int { return len(a) }, DefaultComparer.FormatKey, lt.newIters, slice.Iter(),
 				manifest.Level(level), internalIterOpts{stats: &stats})
 			defer iter.Close()
 			iter.initRangeDel(&iter.rangeDelIter)

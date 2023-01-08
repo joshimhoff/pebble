@@ -440,7 +440,12 @@ func (c *tableCacheShard) newIters(
 		rp = &tableCacheShardReaderProvider{c: c, file: file, dbOpts: dbOpts}
 	}
 	if internalOpts.bytesIterated != nil {
-		iter, err = v.reader.NewCompactionIter(internalOpts.bytesIterated, rp)
+		var lower, upper []byte
+		if file.CreatorUniqueID != 0 {
+			lower = file.Smallest.UserKey
+			upper = file.Largest.UserKey
+		}
+		iter, err = v.reader.NewCompactionIter(lower, upper, internalOpts.bytesIterated, rp)
 	} else {
 		upperBoundInclusive := false
 		if opts != nil {

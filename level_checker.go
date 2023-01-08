@@ -638,7 +638,7 @@ func checkLevelsInternal(c *checkConfig) (err error) {
 		manifestIter := current.L0SublevelFiles[sublevel].Iter()
 		iterOpts := IterOptions{logger: c.logger}
 		li := &levelIter{}
-		li.init(iterOpts, c.cmp, nil /* split */, c.newIters, manifestIter,
+		li.init(iterOpts, c.cmp, nil /* split */, nil, c.newIters, manifestIter,
 			manifest.L0Sublevel(sublevel), internalIterOpts{})
 		li.initRangeDel(&mlevelAlloc[0].rangeDelIter)
 		li.initBoundaryContext(&mlevelAlloc[0].levelIterBoundaryContext)
@@ -652,7 +652,7 @@ func checkLevelsInternal(c *checkConfig) (err error) {
 
 		iterOpts := IterOptions{logger: c.logger}
 		li := &levelIter{}
-		li.init(iterOpts, c.cmp, nil /* split */, c.newIters,
+		li.init(iterOpts, c.cmp, nil /* split */, nil, c.newIters,
 			current.Levels[level].Iter(), manifest.Level(level), internalIterOpts{})
 		li.initRangeDel(&mlevelAlloc[0].rangeDelIter)
 		li.initBoundaryContext(&mlevelAlloc[0].levelIterBoundaryContext)

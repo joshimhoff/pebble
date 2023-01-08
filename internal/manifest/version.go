@@ -244,6 +244,8 @@ type FileMetadata struct {
 
 	// IsNowVirtual is flipped if this file becomes virtual.
 	IsNowVirtual bool
+	// IsExcised is flipped if this file gets excised. Protected by db.mu.
+	IsExcised bool
 
 	// PhysicalFileNum is the file's file num when it is created
 	// This is used in MakeSharedSSTPath

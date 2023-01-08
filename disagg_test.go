@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/testkeys"
@@ -446,6 +445,14 @@ func TestDisaggIngest(t *testing.T) {
 	// exporting a range
 	startIdx := rand.Intn(keys1.Count() / 2)
 	endIdx := startIdx + rand.Intn(keys1.Count()-startIdx)
+
+	if endIdx < keys1.Count() && startIdx > 0 {
+		key1 := testkeys.Key(keys1, startIdx-1)
+		key2 := testkeys.Key(keys1, endIdx+1)
+		require.NoError(t, d2.Set(key1, []byte("lodestar"), nil))
+		require.NoError(t, d2.Set(key2, []byte("lodestar"), nil))
+		d2.Flush()
+	}
 	startKey := testkeys.Key(keys1, startIdx)
 	endKey := testkeys.Key(keys1, endIdx)
 	t.Logf("Exporting keys in range %s to %s (inclusive) from d1 and ingest to d2", startKey, endKey)
@@ -473,7 +480,7 @@ func TestDisaggIngest(t *testing.T) {
 	iter := d1.NewInternalIter(iterOpts)
 	require.NotEqual(t, nil, iter)
 	gotKeys := false
-	for ikey, val := iter.SeekGE(startKey, base.SeekGEFlagsNone); ikey != nil && testkeys.Comparer.Compare(ikey.UserKey, endKey) < 0; ikey, val = iter.Next() {
+	for ikey, val := iter.SeekGE(startKey); ikey != nil && testkeys.Comparer.Compare(ikey.UserKey, endKey) < 0; ikey, val = iter.Next() {
 		ikeyToAdd := ikey.Clone()
 		ikeyToAdd.SetSeqNum(0)
 		if err := w.Add(ikeyToAdd, val.InPlaceValue()); err != nil {
@@ -510,6 +517,14 @@ func TestDisaggIngest(t *testing.T) {
 		require.NoError(t, err2)
 		require.Equal(t, val1, val2, "values mismatch")
 		iter2.Next()
+	}
+	if endIdx < keys1.Count() && startIdx > 0 {
+		iter3 := d2.NewIter(&IterOptions{LowerBound: startKey, KeyTypes: IterKeyTypePointsOnly})
+		key2 := testkeys.Key(keys1, endIdx+1)
+		require.True(t, iter3.SeekGE(key2))
+		require.Equal(t, iter3.Key(), key2)
+		require.Equal(t, iter3.Value(), []byte("lodestar"))
+		iter3.Close()
 	}
 	require.NoError(t, iter1.Close())
 	require.NoError(t, iter2.Close())

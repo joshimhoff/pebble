@@ -53,9 +53,10 @@ type internalIterOpts struct {
 // kind InternalKeyKindRangeDeletion which will be used to pause the levelIter
 // at the sstable until the mergingIter is ready to advance past it.
 type levelIter struct {
-	logger Logger
-	cmp    Compare
-	split  Split
+	logger    Logger
+	cmp       Compare
+	split     Split
+	formatKey base.FormatKey
 	// The lower/upper bounds for iteration as specified at creation or the most
 	// recent call to SetBounds.
 	lower []byte
@@ -214,7 +215,7 @@ func newLevelIter(
 	bytesIterated *uint64,
 ) *levelIter {
 	l := &levelIter{}
-	l.init(opts, cmp, split, newIters, files, level, internalIterOpts{bytesIterated: bytesIterated})
+	l.init(opts, cmp, split, nil, newIters, files, level, internalIterOpts{bytesIterated: bytesIterated})
 	return l
 }
 
@@ -222,6 +223,7 @@ func (l *levelIter) init(
 	opts IterOptions,
 	cmp Compare,
 	split Split,
+	formatKey base.FormatKey,
 	newIters tableNewIters,
 	files manifest.LevelIterator,
 	level manifest.Level,
@@ -232,6 +234,7 @@ func (l *levelIter) init(
 	l.logger = opts.getLogger()
 	l.lower = opts.LowerBound
 	l.upper = opts.UpperBound
+	l.formatKey = formatKey
 	l.tableOpts.TableFilter = opts.TableFilter
 	l.tableOpts.PointKeyFilters = opts.PointKeyFilters
 	l.tableOpts.UseL6Filters = opts.UseL6Filters
@@ -522,10 +525,6 @@ func (l *levelIter) initTableBounds(f *fileMetadata) int {
 		if l.tableOpts.LowerBound == nil || l.cmp(l.tableOpts.LowerBound, f.SmallestPointKey.UserKey) < 0 {
 			l.tableOpts.LowerBound = f.SmallestPointKey.UserKey
 		}
-		if l.tableOpts.UpperBound == nil || l.cmp(l.tableOpts.UpperBound, f.LargestPointKey.UserKey) > 0 {
-			l.tableOpts.UpperBound = f.LargestPointKey.UserKey
-			l.tableOpts.UpperBoundIsInclusive = true
-		}
 	}
 	if l.tableOpts.LowerBound != nil {
 		if l.cmp(f.LargestPointKey.UserKey, l.tableOpts.LowerBound) < 0 {
@@ -540,8 +539,16 @@ func (l *levelIter) initTableBounds(f *fileMetadata) int {
 		}
 	}
 	l.tableOpts.UpperBound = l.upper
+	if f.CreatorUniqueID != 0 {
+		// Virtual sstable. Impose bounds.
+		if l.tableOpts.UpperBound == nil || l.cmp(l.tableOpts.UpperBound, f.LargestPointKey.UserKey) > 0 {
+			l.tableOpts.UpperBound = f.LargestPointKey.UserKey
+			l.tableOpts.UpperBoundIsInclusive = !f.LargestPointKey.IsExclusiveSentinel()
+		}
+	}
 	if l.tableOpts.UpperBound != nil {
-		if l.cmp(f.SmallestPointKey.UserKey, l.tableOpts.UpperBound) >= 0 {
+		if (l.cmp(f.SmallestPointKey.UserKey, l.tableOpts.UpperBound) >= 0 && !l.tableOpts.UpperBoundIsInclusive) ||
+			(l.cmp(f.SmallestPointKey.UserKey, l.tableOpts.UpperBound) > 0) {
 			// The smallest key in the sstable is greater than or equal to the upper
 			// bound.
 			return 1
@@ -617,6 +624,7 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 
 		l.maybeTriggerCombinedIteration(file, dir)
 		if !file.HasPointKeys {
+			fmt.Printf("(levelIter %p) file %s doesn't have point keys\n", l, file.FileNum.String())
 			switch dir {
 			case +1:
 				file = l.files.Next()
@@ -630,6 +638,7 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 		switch l.initTableBounds(file) {
 		case -1:
 			// The largest key in the sstable is smaller than the lower bound.
+			fmt.Printf("(levelIter %p) skipping file %s in case -1\n", l, file.FileNum.String())
 			if dir < 0 {
 				return noFileLoaded
 			}
@@ -638,6 +647,7 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 		case +1:
 			// The smallest key in the sstable is greater than or equal to the upper
 			// bound.
+			fmt.Printf("(levelIter %p) skipping file %s in case +1\n", l, file.FileNum.String())
 			if dir > 0 {
 				return noFileLoaded
 			}
@@ -690,6 +700,7 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 
 		var rangeDelIter keyspan.FragmentIterator
 		var iter internalIterator
+		fmt.Printf("(levelIter %p) calling newIters on %s with opts = %v\n", l, l.iterFile.FileNum.String(), l.tableOpts)
 		iter, rangeDelIter, l.err = l.newIters(l.iterFile, &l.tableOpts, l.internalOpts)
 		l.iter = iter
 		if l.err != nil {
@@ -755,6 +766,11 @@ func (l *levelIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, ba
 		// File changed, so l.iter has changed, and that iterator is not
 		// positioned appropriately.
 		flags = flags.DisableTrySeekUsingNext()
+	}
+	if l.formatKey != nil {
+		fmt.Printf("(levelIter %p) SeekGE(%v)\n", l, l.formatKey(key))
+	} else {
+		fmt.Printf("(levelIter %p) SeekGE()\n", l)
 	}
 	if ikey, val := l.iter.SeekGE(key, flags); ikey != nil {
 		return l.verify(ikey, val)
@@ -891,7 +907,7 @@ func (l *levelIter) Next() (*InternalKey, base.LazyValue) {
 
 	switch {
 	case l.largestBoundary != nil:
-		if l.tableOpts.UpperBound != nil {
+		if l.tableOpts.UpperBound != nil && l.iterFile.CreatorUniqueID == 0 {
 			// The UpperBound was within this file, so don't load the next
 			// file. We leave the largestBoundary unchanged so that subsequent
 			// calls to Next() stay at this file. If a Seek/First/Last call is
@@ -932,7 +948,7 @@ func (l *levelIter) NextPrefix(succKey []byte) (*InternalKey, base.LazyValue) {
 
 	switch {
 	case l.largestBoundary != nil:
-		if l.tableOpts.UpperBound != nil {
+		if l.tableOpts.UpperBound != nil && l.iterFile.CreatorUniqueID == 0 {
 			// The UpperBound was within this file, so don't load the next
 			// file. We leave the largestBoundary unchanged so that subsequent
 			// calls to Next() stay at this file. If a Seek/First/Last call is
@@ -982,7 +998,7 @@ func (l *levelIter) Prev() (*InternalKey, base.LazyValue) {
 
 	switch {
 	case l.smallestBoundary != nil:
-		if l.tableOpts.LowerBound != nil {
+		if l.tableOpts.LowerBound != nil && l.iterFile.CreatorUniqueID == 0 {
 			// The LowerBound was within this file, so don't load the previous
 			// file. We leave the smallestBoundary unchanged so that
 			// subsequent calls to Prev() stay at this file. If a
@@ -1015,6 +1031,7 @@ func (l *levelIter) Prev() (*InternalKey, base.LazyValue) {
 func (l *levelIter) skipEmptyFileForward() (*InternalKey, base.LazyValue) {
 	var key *InternalKey
 	var val base.LazyValue
+	fmt.Printf("(levelIter %p) skipEmptyFileForward\n", l)
 	// The first iteration of this loop starts with an already exhausted
 	// l.iter. The reason for the exhaustion is either that we iterated to the
 	// end of the sstable, or our iteration was terminated early due to the
@@ -1043,7 +1060,7 @@ func (l *levelIter) skipEmptyFileForward() (*InternalKey, base.LazyValue) {
 			// with the RANGEDEL sentinel since it is the smallest InternalKey
 			// that matches the exclusive upper bound, and does not represent
 			// a real key.
-			if l.tableOpts.UpperBound != nil {
+			if l.tableOpts.UpperBound != nil && !l.tableOpts.UpperBoundIsInclusive {
 				if *l.rangeDelIterPtr != nil {
 					l.syntheticBoundary.UserKey = l.tableOpts.UpperBound
 					l.syntheticBoundary.Trailer = InternalKeyRangeDeleteSentinel
@@ -1057,7 +1074,9 @@ func (l *levelIter) skipEmptyFileForward() (*InternalKey, base.LazyValue) {
 				// helps with performance when many levels are populated with
 				// sstables and most don't have any actual keys within the
 				// bounds.
-				return nil, base.LazyValue{}
+				if l.iterFile.CreatorUniqueID == 0 {
+					return nil, base.LazyValue{}
+				}
 			}
 			// If the boundary is a range deletion tombstone, return that key.
 			if l.iterFile.LargestPointKey.Kind() == InternalKeyKindRangeDelete {
@@ -1147,7 +1166,9 @@ func (l *levelIter) skipEmptyFileBackward() (*InternalKey, base.LazyValue) {
 				// helps with performance when many levels are populated with
 				// sstables and most don't have any actual keys within the
 				// bounds.
-				return nil, base.LazyValue{}
+				if l.iterFile.CreatorUniqueID == 0 {
+					return nil, base.LazyValue{}
+				}
 			}
 			// If the boundary is a range deletion tombstone, return that key.
 			if l.iterFile.SmallestPointKey.Kind() == InternalKeyKindRangeDelete {
@@ -1232,6 +1253,10 @@ func (l *levelIter) SetBounds(lower, upper []byte) {
 	}
 
 	l.iter.SetBounds(l.tableOpts.LowerBound, l.tableOpts.UpperBound)
+	type upperBoundInclusiveSetter interface {
+		SetUpperBoundInclusive(upperBoundInclusive bool)
+	}
+	l.iter.(upperBoundInclusiveSetter).SetUpperBoundInclusive(l.tableOpts.UpperBoundIsInclusive)
 }
 
 func (l *levelIter) String() string {

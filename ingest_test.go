@@ -472,7 +472,7 @@ func TestIngestMemtableOverlaps(t *testing.T) {
 						for _, part := range strings.Fields(data) {
 							meta = append(meta, parseMeta(part))
 						}
-						fmt.Fprintf(&buf, "%t\n", ingestMemtableOverlaps(mem.cmp, mem, meta))
+						fmt.Fprintf(&buf, "%t\n", ingestMemtableOverlaps(mem.cmp, mem, meta, keyspan.Span{}))
 					}
 					return buf.String()
 
