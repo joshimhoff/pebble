@@ -407,6 +407,12 @@ func (c *tableCacheShard) newIters(
 		c.unrefValue(v)
 		return nil, nil, err
 	}
+	useFilter := true
+	level := -1
+	if opts != nil {
+		level = manifest.LevelToInt(opts.level)
+		useFilter = manifest.LevelToInt(opts.level) != 6 || opts.UseL6Filters
+	}
 
 	if !ok {
 		c.unrefValue(v)
@@ -421,16 +427,16 @@ func (c *tableCacheShard) newIters(
 		// The point iterator returned must implement the filteredIter
 		// interface, so that the level iterator surfaces file boundaries when
 		// range deletions are present.
+		type levelSetter interface {
+			SetLevel(level int)
+		}
+		if rangeDelIter != nil {
+			rangeDelIter.(levelSetter).SetLevel(level)
+		}
 		return filteredAll, rangeDelIter, err
 	}
 
 	var iter sstable.Iterator
-	useFilter := true
-	level := -1
-	if opts != nil {
-		level = manifest.LevelToInt(opts.level)
-		useFilter = manifest.LevelToInt(opts.level) != 6 || opts.UseL6Filters
-	}
 	tableFormat, err := v.reader.TableFormat()
 	if err != nil {
 		return nil, nil, err

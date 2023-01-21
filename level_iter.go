@@ -624,7 +624,6 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 
 		l.maybeTriggerCombinedIteration(file, dir)
 		if !file.HasPointKeys {
-			fmt.Printf("(levelIter %p) file %s doesn't have point keys\n", l, file.FileNum.String())
 			switch dir {
 			case +1:
 				file = l.files.Next()
@@ -638,7 +637,6 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 		switch l.initTableBounds(file) {
 		case -1:
 			// The largest key in the sstable is smaller than the lower bound.
-			fmt.Printf("(levelIter %p) skipping file %s in case -1\n", l, file.FileNum.String())
 			if dir < 0 {
 				return noFileLoaded
 			}
@@ -647,7 +645,6 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 		case +1:
 			// The smallest key in the sstable is greater than or equal to the upper
 			// bound.
-			fmt.Printf("(levelIter %p) skipping file %s in case +1\n", l, file.FileNum.String())
 			if dir > 0 {
 				return noFileLoaded
 			}
@@ -655,37 +652,44 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 			continue
 		}
 
-		// We have targeted a file but we need to further check the shared sst related options
 		if l.tableOpts.SkipSharedFile && file.IsShared {
-			// No need to check if the file is locally created or not as this is mostly for exporting
 			if l.tableOpts.SharedFileCallback != nil {
-				smallestKey := file.Smallest
-				largestKey := file.Largest
-				if l.tableOpts.LowerBound != nil && l.cmp(smallestKey.UserKey, l.tableOpts.LowerBound) < 0 {
-					smallestKey = base.MakeInternalKey(l.tableOpts.LowerBound, file.LargestSeqNum, base.InternalKeyKindMax)
+				smallestKey := file.Smallest.UserKey
+				largestKey := file.Largest.UserKey
+				foundKey := true
+				if l.tableOpts.LowerBound != nil && l.cmp(smallestKey, l.tableOpts.LowerBound) < 0 {
+					smallestKey = append([]byte(nil), l.tableOpts.LowerBound...)
 				}
-				if l.tableOpts.UpperBound != nil && l.cmp(largestKey.UserKey, l.tableOpts.UpperBound) > 0 {
-					largestKey = base.MakeInternalKey(l.tableOpts.UpperBound, file.SmallestSeqNum, base.InternalKeyKindDelete)
+				if l.tableOpts.UpperBound != nil && l.cmp(largestKey, l.tableOpts.UpperBound) > 0 {
+					largestKey = append([]byte(nil), l.tableOpts.UpperBound...)
+					if !l.tableOpts.UpperBoundIsInclusive {
+						// As largestKey is inclusive, we must find the key < tableOpts.UpperBound.
+						iter, rangeDelIter, err := l.newIters(file, &l.tableOpts, l.internalOpts)
+						if rangeDelIter != nil {
+							rangeDelIter.Close()
+						}
+						if err == nil && iter != nil {
+							key, _ := iter.SeekLT(largestKey, base.SeekLTFlagsNone)
+							if key != nil {
+								largestKey = key.Clone().UserKey
+							} else {
+								foundKey = false
+							}
+							iter.Close()
+						}
+					}
 				}
-				smallest := make([]byte, smallestKey.Size())
-				smallestKey.Encode(smallest)
-				largest := make([]byte, largestKey.Size())
-				largestKey.Encode(largest)
 
-				fileSmallest := make([]byte, file.FileSmallest.Size())
-				file.FileSmallest.Encode(fileSmallest)
-				fileLargest := make([]byte, file.Largest.Size())
-				file.Largest.Encode(fileLargest)
-				meta := SharedSSTMeta{
-					CreatorUniqueID: file.CreatorUniqueID,
-					PhysicalFileNum: uint64(file.PhysicalFileNum),
-					SourceLevel:     uint8(manifest.LevelToInt(l.level)),
-					Smallest:        smallest,
-					Largest:         largest,
-					FileSmallest:    fileSmallest,
-					FileLargest:     fileLargest,
+				if foundKey {
+					meta := SharedSSTMeta{
+						CreatorUniqueID: file.CreatorUniqueID,
+						PhysicalFileNum: uint64(file.PhysicalFileNum),
+						SourceLevel:     uint8(manifest.LevelToInt(l.level)),
+						Smallest:        smallestKey,
+						Largest:         largestKey,
+					}
+					l.tableOpts.SharedFileCallback(meta)
 				}
-				l.tableOpts.SharedFileCallback(meta)
 			}
 			if dir < 0 {
 				file = l.files.Prev()
@@ -700,7 +704,6 @@ func (l *levelIter) loadFile(file *fileMetadata, dir int) loadFileReturnIndicato
 
 		var rangeDelIter keyspan.FragmentIterator
 		var iter internalIterator
-		fmt.Printf("(levelIter %p) calling newIters on %s with opts = %v\n", l, l.iterFile.FileNum.String(), l.tableOpts)
 		iter, rangeDelIter, l.err = l.newIters(l.iterFile, &l.tableOpts, l.internalOpts)
 		l.iter = iter
 		if l.err != nil {
@@ -766,11 +769,6 @@ func (l *levelIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, ba
 		// File changed, so l.iter has changed, and that iterator is not
 		// positioned appropriately.
 		flags = flags.DisableTrySeekUsingNext()
-	}
-	if l.formatKey != nil {
-		fmt.Printf("(levelIter %p) SeekGE(%v)\n", l, l.formatKey(key))
-	} else {
-		fmt.Printf("(levelIter %p) SeekGE()\n", l)
 	}
 	if ikey, val := l.iter.SeekGE(key, flags); ikey != nil {
 		return l.verify(ikey, val)
@@ -1031,7 +1029,6 @@ func (l *levelIter) Prev() (*InternalKey, base.LazyValue) {
 func (l *levelIter) skipEmptyFileForward() (*InternalKey, base.LazyValue) {
 	var key *InternalKey
 	var val base.LazyValue
-	fmt.Printf("(levelIter %p) skipEmptyFileForward\n", l)
 	// The first iteration of this loop starts with an already exhausted
 	// l.iter. The reason for the exhaustion is either that we iterated to the
 	// end of the sstable, or our iteration was terminated early due to the
@@ -1060,7 +1057,7 @@ func (l *levelIter) skipEmptyFileForward() (*InternalKey, base.LazyValue) {
 			// with the RANGEDEL sentinel since it is the smallest InternalKey
 			// that matches the exclusive upper bound, and does not represent
 			// a real key.
-			if l.tableOpts.UpperBound != nil && !l.tableOpts.UpperBoundIsInclusive {
+			if l.tableOpts.UpperBound != nil && l.cmp(l.upper, l.tableOpts.UpperBound) == 0 {
 				if *l.rangeDelIterPtr != nil {
 					l.syntheticBoundary.UserKey = l.tableOpts.UpperBound
 					l.syntheticBoundary.Trailer = InternalKeyRangeDeleteSentinel
@@ -1074,9 +1071,7 @@ func (l *levelIter) skipEmptyFileForward() (*InternalKey, base.LazyValue) {
 				// helps with performance when many levels are populated with
 				// sstables and most don't have any actual keys within the
 				// bounds.
-				if l.iterFile.CreatorUniqueID == 0 {
-					return nil, base.LazyValue{}
-				}
+				return nil, base.LazyValue{}
 			}
 			// If the boundary is a range deletion tombstone, return that key.
 			if l.iterFile.LargestPointKey.Kind() == InternalKeyKindRangeDelete {
@@ -1152,7 +1147,7 @@ func (l *levelIter) skipEmptyFileBackward() (*InternalKey, base.LazyValue) {
 			// with the RANGEDEL sentinel since it is the smallest InternalKey
 			// that is within the inclusive lower bound, and does not
 			// represent a real key.
-			if l.tableOpts.LowerBound != nil {
+			if l.tableOpts.LowerBound != nil && l.cmp(l.lower, l.tableOpts.LowerBound) == 0 {
 				if *l.rangeDelIterPtr != nil {
 					l.syntheticBoundary.UserKey = l.tableOpts.LowerBound
 					l.syntheticBoundary.Trailer = InternalKeyRangeDeleteSentinel
@@ -1166,9 +1161,7 @@ func (l *levelIter) skipEmptyFileBackward() (*InternalKey, base.LazyValue) {
 				// helps with performance when many levels are populated with
 				// sstables and most don't have any actual keys within the
 				// bounds.
-				if l.iterFile.CreatorUniqueID == 0 {
-					return nil, base.LazyValue{}
-				}
+				return nil, base.LazyValue{}
 			}
 			// If the boundary is a range deletion tombstone, return that key.
 			if l.iterFile.SmallestPointKey.Kind() == InternalKeyKindRangeDelete {

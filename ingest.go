@@ -5,7 +5,6 @@
 package pebble
 
 import (
-	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -109,16 +108,27 @@ func ingestLoad1(
 
 	if isShared {
 		meta.IsShared = true
+		meta.HasPointKeys = true
 		meta.CreatorUniqueID = smeta.CreatorUniqueID
 		meta.PhysicalFileNum = base.FileNum(smeta.PhysicalFileNum)
 		targetLevel = 5
+		seqNum := sstable.SeqNumL5PointKey
+		endSeqNum := sstable.SeqNumL5RangeDel
 		if smeta.SourceLevel == 6 {
 			targetLevel = 6
+			seqNum = sstable.SeqNumL6All
+			endSeqNum = sstable.SeqNumL6All
 		}
-		meta.Smallest = base.DecodeInternalKey(smeta.Smallest)
-		meta.Largest = base.DecodeInternalKey(smeta.Largest)
-		meta.FileSmallest = base.DecodeInternalKey(smeta.FileSmallest)
-		meta.FileLargest = base.DecodeInternalKey(smeta.FileLargest)
+		meta.Smallest.UserKey = append([]byte(nil), smeta.Smallest...)
+		meta.Smallest.SetKind(InternalKeyKindSet)
+		meta.Smallest.SetSeqNum(uint64(seqNum))
+		meta.Largest.UserKey = append([]byte(nil), smeta.Largest...)
+		meta.Largest.SetKind(InternalKeyKindSet)
+		meta.Largest.SetSeqNum(uint64(endSeqNum))
+		meta.SmallestPointKey = meta.Smallest
+		meta.LargestPointKey = meta.Largest
+		meta.FileSmallest = meta.Smallest
+		meta.FileLargest = meta.Largest
 	}
 
 	// Avoid loading into the table cache for collecting stats if we
@@ -131,6 +141,15 @@ func ingestLoad1(
 	// meta.Stats here, the file will be loaded into the table cache for
 	// calculating stats before we can remove the original link.
 	maybeSetStatsFromProperties(meta, &r.Properties)
+
+	if isShared {
+		// Sanity check that the various bounds on the file were set consistently.
+		if err := meta.Validate(opts.Comparer.Compare, opts.Comparer.FormatKey); err != nil {
+			return nil, err
+		}
+
+		return &fileMetadataAndLevel{fileMetadata: meta, targetLevel: targetLevel}, nil
+	}
 
 	// XXX(chen): I think the following logic also applies to shared ssts but
 	// we must first "mount" the meta to the reader.. (this has been done above)
@@ -170,13 +189,13 @@ func ingestLoad1(
 		return nil, err
 	}
 	if iter != nil {
-		if isShared {
-			sstRangeDelIter, ok := iter.(*sstable.RangeDelIter)
-			if !ok {
-				panic("ingestLoad1: rangeDelIter returned is not sstable.RangeDelIter")
-			}
-			sstRangeDelIter.SetLevel(6)
-		}
+		//if isShared {
+		//	sstRangeDelIter, ok := iter.(*sstable.RangeDelIter)
+		//	if !ok {
+		//		panic("ingestLoad1: rangeDelIter returned is not sstable.RangeDelIter")
+		//	}
+		//	sstRangeDelIter.SetLevel(6)
+		//}
 		defer iter.Close()
 		var smallest InternalKey
 		if s := iter.First(); s != nil {
@@ -449,12 +468,16 @@ func ingestMemtableOverlaps(cmp Compare, mem flushable, meta []*fileMetadata, ex
 }
 
 func ingestUpdateSeqNum(
-	cmp Compare, format base.FormatKey, seqNum uint64, meta []*fileMetadata,
+	cmp Compare, format base.FormatKey, seqNum uint64, meta []*fileMetadata, shared []int,
 ) error {
 	setSeqFn := func(k base.InternalKey) base.InternalKey {
 		return base.MakeInternalKey(k.UserKey, seqNum, k.Kind())
 	}
-	for _, m := range meta {
+	for idx, m := range meta {
+		if shared[idx] != 0 {
+			// Shared files have sequence numbers set in ingestLoad1.
+			continue
+		}
 		// NB: we set the fields directly here, rather than via their Extend*
 		// methods, as we are updating sequence numbers.
 		if m.HasPointKeys {
@@ -916,10 +939,11 @@ func (d *DB) ingest(
 		}
 		sharedSpans = append(sharedSpans, keyspan.Span{Start: m.Smallest.UserKey, End: m.Largest.UserKey})
 	}
-	sharedSpans = sortAndMergeSpans(d.cmp, sharedSpans)
+	//sharedSpans = sortAndMergeSpans(d.cmp, sharedSpans)
 	for _, span := range sharedSpans {
 		if !exciseSpan.Valid() || d.cmp(span.Start, exciseSpan.Start) < 0 || d.cmp(span.End, exciseSpan.End) > 0 {
-			return IngestOperationStats{}, errors.Newf("ingest: shared span outside of excise span: %s - %s", d.opts.Comparer.FormatKey(span.Start), d.opts.Comparer.FormatKey(span.End))
+			return IngestOperationStats{}, errors.Newf("ingest: shared span outside of excise span: %s - %s vs %s - %s", d.opts.Comparer.FormatKey(span.Start), d.opts.Comparer.FormatKey(span.End),
+				d.opts.Comparer.FormatKey(exciseSpan.Start), d.opts.Comparer.FormatKey(exciseSpan.End))
 		}
 	}
 
@@ -976,7 +1000,7 @@ func (d *DB) ingest(
 		// version edit is applied is the mechanism that persists the
 		// sequence number. The sstables themselves are left unmodified.
 		if err = ingestUpdateSeqNum(
-			d.cmp, d.opts.Comparer.FormatKey, seqNum, meta,
+			d.cmp, d.opts.Comparer.FormatKey, seqNum, meta, shared,
 		); err != nil {
 			return
 		}
@@ -1090,9 +1114,7 @@ func (d *DB) ingestApply(
 		if targetLevels[i] != 0 {
 			// Shared file owned by a different node.
 			f.Level = targetLevels[i]
-			fmt.Printf("file %d, targetLevel = %d\n", meta[i].FileNum, f.Level)
 		} else {
-			fmt.Printf("file %d, targetLevel not found\n", meta[i].FileNum)
 			f.Level, err = findTargetLevel(d, d.newIters, d.tableNewRangeKeyIter, iterOps, d.cmp, current, baseLevel, d.mu.compact.inProgress, m)
 			if err != nil {
 				d.mu.versions.logUnlock()
@@ -1125,7 +1147,6 @@ func (d *DB) ingestApply(
 		levelMetrics.TablesIngested++
 	}
 	if exciseSpan.Valid() {
-		fmt.Printf("excising span %s - %s\n", d.opts.Comparer.FormatKey(exciseSpan.Start), d.opts.Comparer.FormatKey(exciseSpan.End))
 		for level := 0; level < numLevels; level++ {
 			if d.mu.versions.currentVersion().Levels[level].Empty() {
 				continue
@@ -1133,11 +1154,11 @@ func (d *DB) ingestApply(
 
 			var filesToExcise []*fileMetadata
 			slice := d.mu.versions.currentVersion().Overlaps(level, d.cmp, exciseSpan.Start, exciseSpan.End, true)
-			sort.Slice(filesToExcise, func(i, j int) bool {
-				return d.cmp(filesToExcise[i].Smallest.UserKey, filesToExcise[j].Smallest.UserKey) < 0
-			})
 			slice.Each(func(meta *manifest.FileMetadata) {
 				filesToExcise = append(filesToExcise, meta)
+			})
+			sort.Slice(filesToExcise, func(i, j int) bool {
+				return d.cmp(filesToExcise[i].Smallest.UserKey, filesToExcise[j].Smallest.UserKey) < 0
 			})
 			for _, meta := range filesToExcise {
 				if d.cmp(meta.Largest.UserKey, exciseSpan.Start) < 0 ||
@@ -1152,7 +1173,6 @@ func (d *DB) ingestApply(
 					Level:   level,
 					FileNum: meta.FileNum,
 				}] = meta
-				fmt.Printf("deleting file %s as part of excise\n", meta.FileNum)
 				newMeta := &fileMetadata{}
 				*newMeta = *meta
 				meta.IsExcised = true
@@ -1186,14 +1206,19 @@ func (d *DB) ingestApply(
 					ikey, _ := iter.SeekLT(exciseSpan.Start, base.SeekLTFlagsNone)
 					found := false
 					if ikey != nil {
-						newMeta.Largest.UserKey = ikey.Clone().UserKey
-						newMeta.LargestPointKey.UserKey = newMeta.Largest.UserKey
+						newMeta.Largest = ikey.Clone()
+						newMeta.LargestPointKey = newMeta.Largest
 						found = true
 					}
 					if rangeDelIter != nil {
+						rangeDelIter = keyspan.Truncate(d.cmp, rangeDelIter, meta.Smallest.UserKey, meta.Largest.UserKey, &meta.Smallest, &meta.Largest)
 						rdel := rangeDelIter.SeekLT(exciseSpan.Start)
 						if rdel != nil && (!found || d.cmp(rdel.End, newMeta.Largest.UserKey) > 0) {
-							newMeta.Largest.UserKey = append([]byte(nil), rdel.End...)
+							if d.cmp(rdel.End, exciseSpan.Start) > 0 {
+								newMeta.Largest.UserKey = append([]byte(nil), exciseSpan.Start...)
+							} else {
+								newMeta.Largest.UserKey = append([]byte(nil), rdel.End...)
+							}
 							newMeta.Largest.Trailer = InternalKeyRangeDeleteSentinel
 							newMeta.LargestPointKey = newMeta.Largest
 							found = true
@@ -1239,14 +1264,21 @@ func (d *DB) ingestApply(
 					ikey, _ := iter.SeekGE(exciseSpan.End, base.SeekGEFlagsNone)
 					found := false
 					if ikey != nil {
-						newMeta2.Smallest.UserKey = ikey.Clone().UserKey
-						newMeta2.SmallestPointKey.UserKey = newMeta2.Smallest.UserKey
+						newMeta2.Smallest = ikey.Clone()
+						newMeta2.SmallestPointKey = newMeta2.Smallest
 						found = true
 					}
 					if rangeDelIter != nil {
+						rangeDelIter = keyspan.Truncate(d.cmp, rangeDelIter, meta.Smallest.UserKey, meta.Largest.UserKey, &meta.Smallest, &meta.Largest)
 						rdel := rangeDelIter.SeekGE(exciseSpan.End)
 						if rdel != nil && (!found || d.cmp(rdel.Start, newMeta2.Smallest.UserKey) < 0) {
-							newMeta2.Smallest.UserKey = append([]byte(nil), rdel.Start...)
+							if d.cmp(rdel.Start, exciseSpan.End) < 0 {
+								newMeta2.Smallest.UserKey = append([]byte(nil), exciseSpan.End...)
+							} else {
+								newMeta2.Smallest.UserKey = append([]byte(nil), rdel.Start...)
+							}
+							newMeta2.Smallest.SetKind(InternalKeyKindRangeKeyDelete)
+							newMeta2.Smallest.SetSeqNum(rdel.LargestSeqNum())
 							newMeta2.SmallestPointKey = newMeta2.Smallest
 							found = true
 						}

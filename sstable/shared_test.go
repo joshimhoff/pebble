@@ -135,7 +135,7 @@ func TestSharedSST(t *testing.T) {
 	for k, v := iter.First(); k != nil; k, v = iter.Next() {
 		require.Less(t, i, len(visible))
 		t.Logf("  - %s %s", k, v)
-		require.Equal(t, base.MakeInternalKey(kvPairs[visible[i]].k, seqNumL5PointKey, kvPairs[visible[i]].kind), *k)
+		require.Equal(t, base.MakeInternalKey(kvPairs[visible[i]].k, SeqNumL5PointKey, kvPairs[visible[i]].kind), *k)
 		require.Equal(t, kvPairs[visible[i]].v, v)
 		i++
 	}
@@ -153,7 +153,7 @@ func TestSharedSST(t *testing.T) {
 	require.Equal(t, []byte("e"), s.Start)
 	require.Equal(t, []byte("f"), s.End)
 	for i := range s.Keys {
-		require.Equal(t, uint64(seqNumL6All), s.Keys[i].SeqNum())
+		require.Equal(t, uint64(SeqNumL6All), s.Keys[i].SeqNum())
 	}
 	require.NoError(t, rDelIter.Close())
 

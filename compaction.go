@@ -1145,7 +1145,7 @@ func (c *compaction) newInputIter(
 	// internal iterator interface). The resulting merged rangedel iterator is
 	// then included with the point levels in a single mergingIter.
 	newRangeDelIter := func(
-		f manifest.LevelFile, _ *IterOptions, bytesIterated *uint64,
+		f manifest.LevelFile, _ *IterOptions, bytesIterated *uint64, level int,
 	) (keyspan.FragmentIterator, error) {
 		iter, rangeDelIter, err := newIters(f.FileMetadata, nil, /* iter options */
 			internalIterOpts{bytesIterated: &c.bytesIterated})
@@ -1161,6 +1161,10 @@ func (c *compaction) newInputIter(
 			}
 		}
 		if rangeDelIter != nil {
+			type levelSetter interface {
+				SetLevel(level int)
+			}
+			rangeDelIter.(levelSetter).SetLevel(level)
 			// Ensure that rangeDelIter is not closed until the compaction is
 			// finished. This is necessary because range tombstone processing
 			// requires the range tombstones to be held in memory for up to the
@@ -1265,7 +1269,7 @@ func (c *compaction) newInputIter(
 		// mergingIter.
 		iter := level.files.Iter()
 		for f := iter.First(); f != nil; f = iter.Next() {
-			rangeDelIter, err := newRangeDelIter(iter.Take(), nil, &c.bytesIterated)
+			rangeDelIter, err := newRangeDelIter(iter.Take(), nil, &c.bytesIterated, level.level)
 			if err != nil {
 				return errors.Wrapf(err, "pebble: could not open table %s", errors.Safe(f.FileNum))
 			}

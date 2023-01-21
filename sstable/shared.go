@@ -16,9 +16,9 @@ const (
 	SeqNumStart = 4
 	// SeqNumZero is the original 0
 	SeqNumZero       = 3
-	seqNumL5PointKey = 2
-	seqNumL5RangeDel = 1
-	seqNumL6All      = 0
+	SeqNumL5PointKey = 2
+	SeqNumL5RangeDel = 1
+	SeqNumL6All      = 0
 )
 
 type tableIterator struct {
@@ -163,9 +163,9 @@ func (i *tableIterator) isKeyDeleted(k *InternalKey) bool {
 func (i *tableIterator) setKeySeqNum(key *InternalKey) {
 	level := i.GetLevel()
 	if level == 5 {
-		key.SetSeqNum(seqNumL5PointKey)
+		key.SetSeqNum(SeqNumL5PointKey)
 	} else if level == 6 {
-		key.SetSeqNum(seqNumL6All)
+		key.SetSeqNum(SeqNumL6All)
 	} else {
 		panic(fmt.Sprintf("sharedTableIterator: a table with shared flag must have its level at 5 or 6, but table %s has level %d", i.getReader().meta.FileNum, level))
 	}
@@ -528,6 +528,9 @@ func (i *rangeDelIter) isLocallyCreated() bool {
 }
 
 func setSpanSeqNum(s *keyspan.Span, seqnum uint64) {
+	if s == nil {
+		return
+	}
 	for i := range s.Keys {
 		trailer := (s.Keys[i].Trailer & 0xff) | (seqnum << 8)
 		s.Keys[i].Trailer = trailer
@@ -538,9 +541,9 @@ func (i *rangeDelIter) filterSpan(s *keyspan.Span) *keyspan.Span {
 	if i.isShared() && !i.isLocallyCreated() {
 		level := i.GetLevel()
 		if level == 5 {
-			setSpanSeqNum(s, seqNumL5RangeDel)
+			setSpanSeqNum(s, SeqNumL5RangeDel)
 		} else if level == 6 {
-			setSpanSeqNum(s, seqNumL6All)
+			setSpanSeqNum(s, SeqNumL6All)
 		} else {
 			panic("rangeDelIter: a table with shared flag must have its level at 5 or 6")
 		}

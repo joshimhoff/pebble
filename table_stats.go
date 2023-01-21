@@ -305,7 +305,7 @@ func (d *DB) loadTablePointKeyStats(
 func (d *DB) loadTableRangeDelStats(
 	r *sstable.Reader, v *version, level int, meta *fileMetadata, stats *manifest.TableStats,
 ) ([]deleteCompactionHint, error) {
-	iter, err := newCombinedDeletionKeyspanIter(d.opts.Comparer, r, meta)
+	iter, err := newCombinedDeletionKeyspanIter(d.opts.Comparer, r, meta, level)
 	if err != nil {
 		return nil, err
 	}
@@ -655,7 +655,7 @@ func estimateEntrySizes(
 // corresponding to the largest and smallest sequence numbers encountered across
 // the range deletes and range keys deletes that comprised the merged spans.
 func newCombinedDeletionKeyspanIter(
-	comparer *base.Comparer, r *sstable.Reader, m *fileMetadata,
+	comparer *base.Comparer, r *sstable.Reader, m *fileMetadata, level int,
 ) (keyspan.FragmentIterator, error) {
 	// The range del iter and range key iter are each wrapped in their own
 	// defragmenting iter. For each iter, abutting spans can always be merged.
@@ -722,6 +722,10 @@ func newCombinedDeletionKeyspanIter(
 		return nil, err
 	}
 	if iter != nil {
+		type levelSetter interface {
+			SetLevel(level int)
+		}
+		iter.(levelSetter).SetLevel(level)
 		dIter := &keyspan.DefragmentingIter{}
 		dIter.Init(comparer, iter, equal, reducer, new(keyspan.DefragmentingBuffers))
 		iter = dIter
