@@ -672,7 +672,7 @@ type Cache struct {
 //	defer c.Unref()
 //	d, err := pebble.Open(pebble.Options{Cache: c})
 func New(size int64) *Cache {
-	return newShards(size, 2*runtime.GOMAXPROCS(0))
+	return newShards(size, 4*runtime.GOMAXPROCS(0))
 }
 
 func newShards(size int64, shards int) *Cache {
@@ -771,8 +771,10 @@ func (c *Cache) AddSecondaryCache(dir string, fs vfs.FSWithOpenForWrites, capaci
 	capacity = capacity / uint64(len(c.shards))
 	for i := range c.shards {
 		path := fs.PathJoin(dir, fmt.Sprintf("shard-%d", i+1))
-		fs.MkdirAll(path, 0755)
-		c.shards[i].setSecondaryCache(newPersistentCache(path, fs, capacity))
+		_ = fs.RemoveAll(path)
+		if err := fs.MkdirAll(path, 0755); err == nil {
+			c.shards[i].setSecondaryCache(newPersistentCache(path, fs, capacity))
+		}
 	}
 }
 
