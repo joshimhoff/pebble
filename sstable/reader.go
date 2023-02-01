@@ -8,10 +8,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"github.com/google/martian/log"
+	"github.com/prometheus/client_golang/prometheus"
 	"io"
 	"os"
 	"sort"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/cespare/xxhash/v2"
@@ -39,6 +42,12 @@ const (
 	// as opposed to a hardcoded value.
 	initialReadaheadSize = 64 << 10  /* 64KB */
 	maxReadaheadSize     = 256 << 10 /* 256KB */
+)
+
+var (
+	ReadFromLocalDiskLatency                prometheus.Histogram
+	ReadFromPersistentSecondaryCacheLatency prometheus.Histogram
+	ReadFromBlobStorageLatency              prometheus.Histogram
 )
 
 // PersistentCacheValue is the value stored in a persistent cache
@@ -3153,9 +3162,16 @@ func (r *Reader) readBlock(
 
 	v := r.opts.Cache.Alloc(int(bh.Length + blockTrailerLen))
 	b := v.Buf()
+	now := time.Now()
 	if _, err := file.ReadAt(b, int64(bh.Offset)); err != nil {
 		r.opts.Cache.Free(v)
 		return cache.Handle{}, err
+	}
+	dur := time.Since(now)
+	if usesSharedFS {
+		ReadFromBlobStorageLatency.Observe(dur.Seconds())
+	} else {
+		ReadFromLocalDiskLatency.Observe(dur.Seconds())
 	}
 
 	if err := checkChecksum(r.checksumType, b, bh, r.fileNum); err != nil {
