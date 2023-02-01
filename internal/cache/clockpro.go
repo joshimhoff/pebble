@@ -19,14 +19,12 @@ package cache // import "github.com/cockroachdb/pebble/internal/cache"
 
 import (
 	"fmt"
-	"github.com/cockroachdb/pebble/sstable"
 	"os"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
@@ -138,10 +136,7 @@ func (c *shard) Get(id uint64, fileNum base.FileNum, offset uint64, secondary bo
 	if value == nil {
 		atomic.AddInt64(&c.misses, 1)
 		if c.sc != nil && secondary {
-			now := time.Now()
 			if secondaryVal := c.sc.GetAndEvict(id, fileNum, offset); len(secondaryVal) > 0 {
-				dur := time.Since(now)
-				sstable.ReadFromPersistentSecondaryCacheLatency.Observe(dur.Seconds())
 				v := c.parent.Alloc(len(secondaryVal))
 				copy(v.Buf(), secondaryVal)
 				c.Set(id, fileNum, offset, v, true)
