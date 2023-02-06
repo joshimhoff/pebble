@@ -1787,7 +1787,9 @@ func (d *DB) Metrics() *Metrics {
 
 	d.mu.Unlock()
 
-	metrics.BlockCache = d.opts.Cache.Metrics()
+	primary, secondary := d.opts.Cache.Metrics()
+	metrics.PrimaryCache = primary
+	metrics.SecondaryCache = secondary
 	metrics.TableCache, metrics.Filter = d.tableCache.metrics()
 	metrics.TableIters = int64(d.tableCache.iterCount())
 	return metrics

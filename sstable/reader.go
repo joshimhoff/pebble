@@ -237,6 +237,8 @@ type singleLevelIterator struct {
 	closeHook func(i Iterator) error
 	stats     *base.InternalIteratorStats
 
+	isPartOfCompaction bool
+
 	// boundsCmp and positionedUsingLatestBounds are for optimizing iteration
 	// that uses multiple adjacent bounds. The seek after setting a new bound
 	// can use the fact that the iterator is either within the previous bounds
@@ -419,7 +421,7 @@ func (i *singleLevelIterator) init(
 	if r.err != nil {
 		return r.err
 	}
-	indexH, err := r.readIndex(stats)
+	indexH, err := r.readIndex(stats, i.isPartOfCompaction)
 	if err != nil {
 		return err
 	}
@@ -465,6 +467,7 @@ func (i *singleLevelIterator) setupForCompaction() {
 			i.dataRS.sequentialFile = f
 		}
 	}
+	i.isPartOfCompaction = true
 }
 
 func (i *singleLevelIterator) resetForReuse() singleLevelIterator {
@@ -576,7 +579,7 @@ func (i *singleLevelIterator) loadBlock(dir int8) loadBlockResult {
 func (i *singleLevelIterator) readBlockForVBR(
 	h BlockHandle, stats *base.InternalIteratorStats,
 ) (cache.Handle, error) {
-	return i.reader.readBlock(h, nil /* transform */, nil /* raState */, stats)
+	return i.reader.readBlockInternal(h, nil /* transform */, nil /* raState */, stats, i.isPartOfCompaction)
 }
 
 // resolveMaybeExcluded is invoked when the block-property filterer has found
@@ -649,7 +652,7 @@ func (i *singleLevelIterator) resolveMaybeExcluded(dir int8) intersectsResult {
 func (i *singleLevelIterator) readBlockWithStats(
 	bh BlockHandle, raState *readaheadState,
 ) (cache.Handle, error) {
-	return i.reader.readBlock(bh, nil /* transform */, raState, i.stats)
+	return i.reader.readBlockInternal(bh, nil /* transform */, raState, i.stats, i.isPartOfCompaction)
 }
 
 func (i *singleLevelIterator) initBoundsForAlreadyLoadedBlock() {
@@ -915,7 +918,7 @@ func (i *singleLevelIterator) seekPrefixGE(
 		i.lastBloomFilterMatched = false
 		// Check prefix bloom filter.
 		var dataH cache.Handle
-		dataH, i.err = i.reader.readFilter(i.stats)
+		dataH, i.err = i.reader.readFilter(i.stats, i.isPartOfCompaction)
 		if i.err != nil {
 			i.data.invalidate()
 			return nil, base.LazyValue{}
@@ -1728,7 +1731,7 @@ func (i *twoLevelIterator) init(
 	if r.err != nil {
 		return r.err
 	}
-	topLevelIndexH, err := r.readIndex(stats)
+	topLevelIndexH, err := r.readIndex(stats, i.isPartOfCompaction)
 	if err != nil {
 		return err
 	}
@@ -1953,7 +1956,7 @@ func (i *twoLevelIterator) SeekPrefixGE(
 		}
 		i.lastBloomFilterMatched = false
 		var dataH cache.Handle
-		dataH, i.err = i.reader.readFilter(i.stats)
+		dataH, i.err = i.reader.readFilter(i.stats, i.isPartOfCompaction)
 		if i.err != nil {
 			i.data.invalidate()
 			return nil, base.LazyValue{}
@@ -3052,12 +3055,12 @@ func (i *rangeKeyFragmentBlockIter) Close() error {
 	return err
 }
 
-func (r *Reader) readIndex(stats *base.InternalIteratorStats) (cache.Handle, error) {
-	return r.readBlock(r.indexBH, nil /* transform */, nil /* readaheadState */, stats)
+func (r *Reader) readIndex(stats *base.InternalIteratorStats, isPartOfCompaction bool) (cache.Handle, error) {
+	return r.readBlockInternal(r.indexBH, nil /* transform */, nil /* readaheadState */, stats, isPartOfCompaction)
 }
 
-func (r *Reader) readFilter(stats *base.InternalIteratorStats) (cache.Handle, error) {
-	return r.readBlock(r.filterBH, nil /* transform */, nil /* readaheadState */, stats)
+func (r *Reader) readFilter(stats *base.InternalIteratorStats, isPartOfCompaction bool) (cache.Handle, error) {
+	return r.readBlockInternal(r.filterBH, nil /* transform */, nil /* readaheadState */, stats, isPartOfCompaction)
 }
 
 func (r *Reader) readRangeDel(stats *base.InternalIteratorStats) (cache.Handle, error) {
@@ -3096,12 +3099,26 @@ func (r *Reader) readBlock(
 	transform blockTransform,
 	raState *readaheadState,
 	stats *base.InternalIteratorStats,
+	) (_ cache.Handle, _ error) {
+	// If readBlock is called as opposed to readBlockInternal, we assume the read is not
+	// coming from a compaction. That is, if it possible the read is coming from a compaction,
+	// readBlockInternal should be called instead of readBlock. This is hacky but prob okay for
+	// now.
+	return r.readBlockInternal(bh, transform, raState, stats, /* isPartOfCompaction */false)
+}
+
+func (r *Reader) readBlockInternal(
+	bh BlockHandle,
+	transform blockTransform,
+	raState *readaheadState,
+	stats *base.InternalIteratorStats,
+	isPartOfCompaction bool,
 ) (_ cache.Handle, _ error) {
 	usesSharedFS := false
 	if r.meta != nil {
 		usesSharedFS = r.meta.IsShared
 	}
-	if h := r.opts.Cache.Get(r.cacheID, r.fileNum, bh.Offset, usesSharedFS); h.Get() != nil {
+	if h := r.opts.Cache.Get(r.cacheID, r.fileNum, bh.Offset, usesSharedFS, isPartOfCompaction); h.Get() != nil {
 		if raState != nil {
 			raState.recordCacheHit(int64(bh.Offset), int64(bh.Length+blockTrailerLen))
 		}
@@ -3362,7 +3379,7 @@ func (r *Reader) Layout() (*Layout, error) {
 		Format:     r.tableFormat,
 	}
 
-	indexH, err := r.readIndex(nil /* stats */)
+	indexH, err := r.readIndex(nil /* stats */, false /* isPartOfCompaction */)
 	if err != nil {
 		return nil, err
 	}
@@ -3518,7 +3535,7 @@ func (r *Reader) EstimateDiskUsage(start, end []byte) (uint64, error) {
 		return 0, r.err
 	}
 
-	indexH, err := r.readIndex(nil /* stats */)
+	indexH, err := r.readIndex(nil /* stats */, false /* isPartOfCompaction */)
 	if err != nil {
 		return 0, err
 	}

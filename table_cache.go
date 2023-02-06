@@ -175,8 +175,8 @@ func (c *tableCacheContainer) metrics() (CacheMetrics, FilterMetrics) {
 		s.mu.RLock()
 		m.Count += int64(len(s.mu.nodes))
 		s.mu.RUnlock()
-		m.Hits += atomic.LoadInt64(&s.atomic.hits)
-		m.Misses += atomic.LoadInt64(&s.atomic.misses)
+		m.UserFacingReadHits += atomic.LoadInt64(&s.atomic.hits)
+		m.UserFacingReadMisses += atomic.LoadInt64(&s.atomic.misses)
 	}
 	m.Size = m.Count * int64(unsafe.Sizeof(sstable.Reader{}))
 	f := FilterMetrics{

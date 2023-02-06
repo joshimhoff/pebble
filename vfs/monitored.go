@@ -1,8 +1,16 @@
 package vfs
 
 import (
+	"sync/atomic"
+	"time"
+
 	"github.com/cockroachdb/errors"
-	"sync"
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+var buckets = append(
+	prometheus.LinearBuckets(0.0, float64(time.Microsecond*100), 50),
+	prometheus.ExponentialBucketsRange(float64(time.Millisecond*5), float64(10*time.Second), 50)...,
 )
 
 var _ FS = (*monitoredFS)(nil)
@@ -10,8 +18,6 @@ var _ FSWithOpenForWrites = (*monitoredFS)(nil)
 
 type monitoredFS struct {
 	FS
-	// TODO(): Keep thread-safe but also make fast.
-	mu sync.Mutex
 	stats *Stats
 }
 
@@ -25,20 +31,31 @@ type monitoredFile struct {
 
 // TODO(): How comprehensive should we be? Should we worry about file system ops?
 type Stats struct {
-	BytesRead int
-	BytesWritten int
-	ReadIops int
-	WriteIops int
-	// TODO(): Add back.
-	//ReadLatency prometheus.Histogram
-	//WriteLatency prometheus.Histogram
-	//SyncLatency prometheus.Histogram
+	BytesRead int64
+	BytesWritten int64
+	ReadIops int64
+	WriteIops int64
+	ReadErrors int64
+	WriteErrors int64
+	ReadLatency prometheus.Histogram
+	WriteLatency prometheus.Histogram
+	SyncLatency prometheus.Histogram
 }
 
 func WithMonitoring(
 	innerFS FS,
 	stats *Stats,
 	) FS {
+	// TODO(): Fix terrible API.
+	stats.ReadLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Buckets: buckets,
+	})
+	stats.WriteLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Buckets: buckets,
+	})
+	stats.SyncLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Buckets: buckets,
+	})
 	return &monitoredFS{FS: innerFS, stats: stats}
 }
 
@@ -72,53 +89,49 @@ func (fs *monitoredFS) OpenForWrites(name string, opts ...OpenOption) (RandomWri
 }
 
 func (f *monitoredFile) Read(p []byte) (n int, err error) {
-	//now  := time.Now()
+	now  := time.Now()
 	n, err = f.File.Read(p)
-	//duration := time.Since(now)
+	duration := time.Since(now)
 
-	f.fs.mu.Lock()
-	f.fs.stats.BytesRead += len(p)
-	f.fs.stats.ReadIops++
-	// TODO(): Should we count errors?
+	atomic.AddInt64(&f.fs.stats.BytesRead, int64(len(p)))
+	atomic.AddInt64(&f.fs.stats.ReadIops, 1)
 	if err != nil {
-		// TODO(): Prometheus histograms are already thread-safe, right?
-		//f.fs.stats.ReadLatency.Observe(duration.Seconds())
+		atomic.AddInt64(&f.fs.stats.ReadErrors, 1)
+	} else {
+		f.fs.stats.ReadLatency.Observe(float64(duration.Nanoseconds()))
 	}
-	f.fs.mu.Unlock()
 
 	return n, err
 }
 
 func (f *monitoredFile) ReadAt(p []byte, off int64) (n int, err error) {
-	//now  := time.Now()
+	now  := time.Now()
 	n, err = f.File.ReadAt(p, off)
-	//duration := time.Since(now)
+	duration := time.Since(now)
 
-	f.fs.mu.Lock()
-	f.fs.stats.BytesRead += len(p)
-	f.fs.stats.ReadIops++
-	// TODO(): Should we count errors?
+	atomic.AddInt64(&f.fs.stats.BytesRead, int64(len(p)))
+	atomic.AddInt64(&f.fs.stats.ReadIops, 1)
 	if err != nil {
-		//f.fs.stats.ReadLatency.Observe(duration.Seconds())
+		atomic.AddInt64(&f.fs.stats.ReadErrors, 1)
+	} else {
+		f.fs.stats.ReadLatency.Observe(float64(duration.Nanoseconds()))
 	}
-	f.fs.mu.Unlock()
 
 	return n, err
 }
 
 func (f *monitoredFile) Write(p []byte) (n int, err error) {
-	//now  := time.Now()
+	now  := time.Now()
 	n, err = f.File.Write(p)
-	//duration := time.Since(now)
+	duration := time.Since(now)
 
-	f.fs.mu.Lock()
-	f.fs.stats.BytesWritten += len(p)
-	f.fs.stats.WriteIops++
-	// TODO(): Should we count errors?
+	atomic.AddInt64(&f.fs.stats.BytesWritten, int64(len(p)))
+	atomic.AddInt64(&f.fs.stats.WriteIops, 1)
 	if err != nil {
-		//f.fs.stats.WriteLatency.Observe(duration.Seconds())
+		atomic.AddInt64(&f.fs.stats.WriteErrors, 1)
+	} else {
+		f.fs.stats.WriteLatency.Observe(float64(duration.Nanoseconds()))
 	}
-	f.fs.mu.Unlock()
 
 	return n, err
 }
@@ -129,36 +142,34 @@ func (f *monitoredFile) WriteAt(p []byte, off int64) (n int, err error) {
 		return 0, errors.New("boom")
 	}
 
-	//now  := time.Now()
+	now  := time.Now()
 	n, err = randomWriteFile.WriteAt(p, off)
-	//duration := time.Since(now)
+	duration := time.Since(now)
 
-	f.fs.mu.Lock()
-	f.fs.stats.BytesWritten += len(p)
-	f.fs.stats.WriteIops++
-	// TODO(): Should we count errors?
+	atomic.AddInt64(&f.fs.stats.BytesWritten, int64(len(p)))
+	atomic.AddInt64(&f.fs.stats.WriteIops, 1)
 	if err != nil {
-		//f.fs.stats.WriteLatency.Observe(duration.Seconds())
+		atomic.AddInt64(&f.fs.stats.WriteErrors, 1)
+	} else {
+		f.fs.stats.WriteLatency.Observe(float64(duration.Nanoseconds()))
 	}
-	f.fs.mu.Unlock()
 
 	return n, err
 
 }
 
 func (f *monitoredFile) Sync() (err error) {
-	//now  := time.Now()
+	now  := time.Now()
 	err = f.File.Sync()
-	//duration := time.Since(now)
+	duration := time.Since(now)
 
-	f.fs.mu.Lock()
 	// TODO(): Does a sync cost one write iop?
-	f.fs.stats.WriteIops++
-	// TODO(): Should we count errors?
+	atomic.AddInt64(&f.fs.stats.WriteIops, 1)
 	if err != nil {
-		//f.fs.stats.SyncLatency.Observe(duration.Seconds())
+		atomic.AddInt64(&f.fs.stats.WriteErrors, 1)
+	} else {
+		f.fs.stats.SyncLatency.Observe(float64(duration.Nanoseconds()))
 	}
-	f.fs.mu.Unlock()
 
 	return err
 }

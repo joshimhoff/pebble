@@ -32,7 +32,8 @@ func formatCacheMetrics(w redact.SafePrinter, m *CacheMetrics, name redact.SafeS
 		name,
 		humanize.SI.Int64(m.Count),
 		humanize.IEC.Int64(m.Size),
-		redact.Safe(hitRate(m.Hits, m.Misses)))
+		// TODO(): Elaborate.
+		redact.Safe(hitRate(m.UserFacingReadHits, m.UserFacingReadMisses)))
 }
 
 // LevelMetrics holds per-level metrics such as the number of files and total
@@ -153,7 +154,8 @@ func (m *LevelMetrics) format(w redact.SafePrinter, score redact.SafeValue) {
 // be testing that performs various operations on a DB and verifies that the
 // metrics reflect those operations.
 type Metrics struct {
-	BlockCache CacheMetrics
+	PrimaryCache CacheMetrics
+	SecondaryCache CacheMetrics
 
 	Compact struct {
 		// The total number of compactions, and per-compaction type counts.
@@ -448,7 +450,8 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("   ztbl %9d %7s\n",
 		redact.Safe(m.Table.ZombieCount),
 		humanize.IEC.Uint64(m.Table.ZombieSize))
-	formatCacheMetrics(w, &m.BlockCache, "bcache")
+	formatCacheMetrics(w, &m.PrimaryCache, "bcache")
+	formatCacheMetrics(w, &m.SecondaryCache, "scache")
 	formatCacheMetrics(w, &m.TableCache, "tcache")
 	w.Printf("  snaps %9d %7s %7d  (score == earliest seq num)\n",
 		redact.Safe(m.Snapshots.Count),

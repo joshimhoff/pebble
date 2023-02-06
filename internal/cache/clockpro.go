@@ -78,10 +78,15 @@ func (h Handle) Release() {
 }
 
 type shard struct {
-	hits   int64
-	misses int64
-	secondaryHits int64
-	secondaryMisses int64
+	userReadHits   int64
+	userReadMisses int64
+	userReadSecondaryHits int64
+	userReadSecondaryMisses int64
+
+	compactionHits   int64
+	compactionMisses int64
+	compactionSecondaryHits int64
+	compactionSecondaryMisses int64
 
 	mu sync.RWMutex
 
@@ -123,7 +128,7 @@ func (c *shard) setSecondaryCache(sc SecondaryCache) {
 	c.sc = sc
 }
 
-func (c *shard) Get(id uint64, fileNum base.FileNum, offset uint64, secondary bool) Handle {
+func (c *shard) Get(id uint64, fileNum base.FileNum, offset uint64, secondary bool, isPartOfCompaction bool) Handle {
 	c.mu.RLock()
 	var value *Value
 	if e := c.blocks.Get(key{fileKey{id, fileNum}, offset}); e != nil {
@@ -134,20 +139,36 @@ func (c *shard) Get(id uint64, fileNum base.FileNum, offset uint64, secondary bo
 	}
 	c.mu.RUnlock()
 	if value == nil {
-		atomic.AddInt64(&c.misses, 1)
+		if isPartOfCompaction {
+			atomic.AddInt64(&c.compactionMisses, 1)
+		} else {
+			atomic.AddInt64(&c.userReadMisses, 1)
+		}
 		if c.sc != nil && secondary {
 			if secondaryVal := c.sc.GetAndEvict(id, fileNum, offset); len(secondaryVal) > 0 {
 				v := c.parent.Alloc(len(secondaryVal))
 				copy(v.Buf(), secondaryVal)
 				c.Set(id, fileNum, offset, v, true)
-				atomic.AddInt64(&c.secondaryHits, 1)
+				if isPartOfCompaction {
+					atomic.AddInt64(&c.compactionSecondaryHits, 1)
+				} else {
+					atomic.AddInt64(&c.userReadSecondaryHits, 1)
+				}
 				return Handle{value: value}
 			}
-			atomic.AddInt64(&c.secondaryMisses, 1)
+			if isPartOfCompaction {
+				atomic.AddInt64(&c.compactionSecondaryMisses, 1)
+			} else {
+				atomic.AddInt64(&c.userReadSecondaryMisses, 1)
+			}
 		}
 		return Handle{}
 	}
-	atomic.AddInt64(&c.hits, 1)
+	if isPartOfCompaction {
+		atomic.AddInt64(&c.compactionHits, 1)
+	} else {
+		atomic.AddInt64(&c.userReadHits, 1)
+	}
 	return Handle{value: value}
 }
 
@@ -607,15 +628,18 @@ func (c *shard) runHandTest() {
 // Metrics holds metrics for the cache.
 type Metrics struct {
 	// The number of bytes inuse by the cache.
+	// TODO(): Break down.
 	Size int64
 	// The count of objects (blocks or tables) in the cache.
 	Count int64
+
 	// The number of cache hits.
-	Hits int64
+	CompactionHits int64
 	// The number of cache misses.
-	Misses int64
-	SecondaryHits int64
-	SecondaryMisses int64
+	CompactionMisses int64
+
+	UserFacingReadHits int64
+	UserFacingReadMisses int64
 }
 
 // Cache implements Pebble's sharded block cache. The Clock-PRO algorithm is
@@ -785,8 +809,8 @@ func (c *Cache) AddSecondaryCache(dir string, fs vfs.FSWithOpenForWrites, capaci
 
 // Get retrieves the cache value for the specified file and offset, returning
 // nil if no value is present.
-func (c *Cache) Get(id uint64, fileNum base.FileNum, offset uint64, secondary bool) Handle {
-	return c.getShard(id, fileNum, offset).Get(id, fileNum, offset, secondary)
+func (c *Cache) Get(id uint64, fileNum base.FileNum, offset uint64, secondary bool, isPartOfCompaction bool) Handle {
+	return c.getShard(id, fileNum, offset).Get(id, fileNum, offset, secondary, isPartOfCompaction)
 }
 
 // Set sets the cache value for the specified file and offset, overwriting an
@@ -869,20 +893,30 @@ func (c *Cache) Reserve(n int) func() {
 }
 
 // Metrics returns the metrics for the cache.
-func (c *Cache) Metrics() Metrics {
-	var m Metrics
+func (c *Cache) Metrics() (Metrics, Metrics) {
+	var primary Metrics
+	var secondary Metrics
 	for i := range c.shards {
 		s := &c.shards[i]
 		s.mu.RLock()
-		m.Count += int64(s.blocks.Count())
-		m.Size += s.sizeHot + s.sizeCold
+		// TODO(): For now, count & size are primary only.
+		primary.Count += int64(s.blocks.Count())
+		primary.Size += s.sizeHot + s.sizeCold
 		s.mu.RUnlock()
-		m.Hits += atomic.LoadInt64(&s.hits)
-		m.Misses += atomic.LoadInt64(&s.misses)
-		m.SecondaryHits += atomic.LoadInt64(&s.secondaryHits)
-		m.SecondaryMisses += atomic.LoadInt64(&s.secondaryMisses)
+
+		primary.CompactionHits += atomic.LoadInt64(&s.compactionHits)
+		primary.CompactionMisses += atomic.LoadInt64(&s.compactionMisses)
+
+		primary.UserFacingReadHits += atomic.LoadInt64(&s.userReadHits)
+		primary.UserFacingReadMisses += atomic.LoadInt64(&s.userReadMisses)
+
+		secondary.CompactionHits += atomic.LoadInt64(&s.compactionSecondaryHits)
+		secondary.CompactionMisses += atomic.LoadInt64(&s.compactionSecondaryMisses)
+
+		secondary.UserFacingReadHits += atomic.LoadInt64(&s.userReadSecondaryHits)
+		secondary.UserFacingReadMisses += atomic.LoadInt64(&s.userReadSecondaryMisses)
 	}
-	return m
+	return primary, secondary
 }
 
 // NewID returns a new ID to be used as a namespace for cached file
