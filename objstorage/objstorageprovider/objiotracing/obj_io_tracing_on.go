@@ -285,6 +285,7 @@ func WithLevel(ctx context.Context, level int) context.Context {
 }
 
 const (
+	// TODO(): Export depending on final package structure.
 	eventSize            = int(unsafe.Sizeof(Event{}))
 	targetEntriesPerFile = 256 * 1024 * 1024 / eventSize // 256MB files
 	eventsPerBuf         = 16

@@ -25,8 +25,8 @@ func TestTracing(t *testing.T) {
 	if !objiotracing.Enabled {
 		t.Skipf("test can only be run under pebble_obj_io_tracing build tag")
 	}
-	fs := vfs.NewMem()
-	d, err := pebble.Open("", &pebble.Options{FS: fs})
+	fs := vfs.Default
+	d, err := pebble.Open("testdata", &pebble.Options{FS: fs})
 	require.NoError(t, err)
 
 	require.NoError(t, d.Set([]byte("a"), []byte("aaa"), nil))

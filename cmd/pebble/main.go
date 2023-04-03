@@ -51,7 +51,8 @@ func main() {
 		Use:   "pebble [command] (flags)",
 		Short: "pebble benchmarking/introspection tool",
 	}
-	rootCmd.AddCommand(benchCmd)
+	// TODO(): Think over.
+	rootCmd.AddCommand(benchCmd, cacheCmd)
 
 	t := tool.New(tool.Comparers(mvccComparer, testkeys.Comparer), tool.Mergers(fauxMVCCMerger))
 	rootCmd.AddCommand(t.Commands...)
