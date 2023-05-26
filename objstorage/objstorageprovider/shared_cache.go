@@ -10,6 +10,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -192,28 +193,44 @@ func (sc *sharedCache) getShard(fileNum base.FileNum, ofs int64) *sharedCacheSha
 
 type sharedCacheShard struct {
 	file         vfs.File
-	sizeInBlocks int64
+	numDataBlocks int64
+	numMetadataBlocks int64
 	blockSize    int
 	mu           struct {
 		sync.Mutex
-		// TODO(josh): Neither of these datastructures are space-efficient.
+
+		// TODO(josh): None of these datastructures are space-efficient.
 		// Focusing on correctness to start.
-		where map[metadataKey]int64
+		where map[metadataMapKey]int64
+		table []*metadataMapKey
 		free  []int64
+		seq   int32
 	}
+	log []metadataLogEntryBatch
 }
 
-type metadataKey struct {
+type metadataMapKey struct {
 	filenum    base.FileNum
-	blockIndex int64
+	logicalBlockInd int64
+}
+
+type metadataLogEntry struct {
+	filenum    base.FileNum
+	logicalBlockInd int64
+	cacheBlockInd int64
+}
+
+// TODO(josh): We should make this type more space-efficient later on.
+type metadataLogEntryBatch struct {
+	e1 metadataLogEntry
+	e2 metadataLogEntry
+	seq int32
 }
 
 func (s *sharedCacheShard) init(
 	fs vfs.FS, fsDir string, shardIdx int, sizeInBlocks int64, blockSize int,
 ) error {
-	*s = sharedCacheShard{
-		sizeInBlocks: sizeInBlocks,
-	}
+	*s = sharedCacheShard{}
 	if blockSize < 1024 || shardingBlockSize%blockSize != 0 {
 		return errors.Newf("invalid block size %d (must divide %d)", blockSize, shardingBlockSize)
 	}
@@ -229,12 +246,69 @@ func (s *sharedCacheShard) init(
 	}
 	s.file = file
 
-	// TODO(josh): Right now, the secondary cache is not persistent. All existing
-	// cache contents will be over-written, since all metadata is only stored in
-	// memory.
-	s.mu.where = make(map[metadataKey]int64)
-	for i := int64(0); i < sizeInBlocks; i++ {
-		s.mu.free = append(s.mu.free, i)
+	// TODO(josh): For now, changing parameters of the cache, such as sizeInBlocks, is not
+	// supported, if metadata persistence is enabled.
+	metadataBatchSizeInBytes := int64(unsafe.Sizeof(metadataLogEntryBatch{}))
+	// TODO(): Used to be 2x.
+	metadataTotalSizeInBytes := metadataBatchSizeInBytes * sizeInBlocks
+	numMetadataBlocks := (metadataTotalSizeInBytes + int64(blockSize)-1) / int64(blockSize)
+
+	s.numMetadataBlocks = numMetadataBlocks
+	s.numDataBlocks = sizeInBlocks - numMetadataBlocks
+
+	logAsBytes := make([]byte, metadataTotalSizeInBytes)
+	_, err = s.file.ReadAt(logAsBytes, 0)
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	// TODO(): Used to be 2x.
+	logLen := s.numDataBlocks
+	logPtr := unsafe.Pointer(&logAsBytes[0])
+	log := unsafe.Slice((*metadataLogEntryBatch)(logPtr), logLen)
+	s.log = log
+
+	maxSeq := int32(0)
+	maxEntry := 0
+	for i, e := range log {
+		if e.seq > maxSeq {
+			maxSeq = e.seq
+			maxEntry = i
+		}
+	}
+	s.mu.seq = maxSeq + 1
+
+	s.mu.table = make([]*metadataMapKey, s.numDataBlocks)
+	// TODO(): Assert that cache block indexes increase as expected.
+	var prevSeq int32
+	for i := 0; int64(i) < logLen; i++ {
+		entry := log[(i + maxEntry + 1) % int(logLen)]
+		if entry.seq == 0 {
+			continue
+		}
+		if i != 0 && entry.seq != prevSeq + 1 {
+			return fmt.Errorf("sequence numbers not monotonically increasing: %v %v", prevSeq, entry.seq)
+		}
+		prevSeq = entry.seq
+		for _, subEntry := range []metadataLogEntry{entry.e1, entry.e2} {
+			// TODO(): Allow filenum = 0.
+			if subEntry.filenum != 0 {
+				k := metadataMapKey{
+					filenum:         subEntry.filenum,
+					logicalBlockInd: subEntry.logicalBlockInd,
+				}
+				s.mu.table[subEntry.cacheBlockInd] = &k
+			}
+		}
+	}
+
+	s.mu.where = make(map[metadataMapKey]int64)
+	for cacheBlockInd, e := range s.mu.table {
+		if e != nil {
+			s.mu.where[*e] = int64(cacheBlockInd)
+		} else {
+			s.mu.free = append(s.mu.free, int64(cacheBlockInd))
+		}
 	}
 
 	return nil
@@ -270,26 +344,34 @@ func (s *sharedCacheShard) Get(fileNum base.FileNum, p []byte, ofs int64) (n int
 	// path, max two iterations of this loop will be executed, since reads are sized
 	// in units of sstable block size.
 	for {
-		cacheBlockInd, ok := s.mu.where[metadataKey{
+		cacheBlockInd, ok := s.mu.where[metadataMapKey{
 			filenum:    fileNum,
-			blockIndex: (ofs + int64(n)) / int64(s.blockSize),
+			logicalBlockInd: (ofs + int64(n)) / int64(s.blockSize),
 		}]
 		if !ok {
 			return n, nil
 		}
 
-		readAt := cacheBlockInd * int64(s.blockSize)
+		readAt := cacheBlockInd * int64(s.blockSize) + s.numMetadataBlocks * int64(s.blockSize)
 		if n == 0 { // if first read
 			readAt += ofs % int64(s.blockSize)
 		}
+
 		readSize := s.blockSize
 		if n == 0 { // if first read
 			// Cast to int safe since ofs is modded by block size.
 			readSize -= int(ofs % int64(s.blockSize))
 		}
+		if len(p[n:]) <= readSize {
+			readSize = len(p[n:])
+		}
+
+		if readAt + int64(readSize) < s.numMetadataBlocks * int64(s.blockSize) {
+			panic(fmt.Sprintf("reading a data block from the metadata block section: %v %v %v %v", readAt, readSize, s.numMetadataBlocks, s.blockSize))
+		}
 
 		if len(p[n:]) <= readSize {
-			numRead, err := s.file.ReadAt(p[n:], readAt)
+			numRead, err := s.file.ReadAt(p[n:n+readSize], readAt)
 			return n + numRead, err
 		}
 		numRead, err := s.file.ReadAt(p[n:n+readSize], readAt)
@@ -331,7 +413,7 @@ func (s *sharedCacheShard) Set(fileNum base.FileNum, p []byte, ofs int64) error 
 		if len(s.mu.free) == 0 {
 			// TODO(josh): Right now, we do random eviction. Eventually, we will do something
 			// more sophisticated, e.g. leverage ClockPro.
-			var k metadataKey
+			var k metadataMapKey
 			for k1, v := range s.mu.where {
 				cacheBlockInd = v
 				k = k1
@@ -343,26 +425,82 @@ func (s *sharedCacheShard) Set(fileNum base.FileNum, p []byte, ofs int64) error 
 			s.mu.free = s.mu.free[:len(s.mu.free)-1]
 		}
 
-		s.mu.where[metadataKey{
+		k := metadataMapKey{
 			filenum:    fileNum,
-			blockIndex: (ofs + int64(n)) / int64(s.blockSize),
-		}] = cacheBlockInd
+		logicalBlockInd: (ofs + int64(n)) / int64(s.blockSize),
+		}
+		s.mu.where[k] = cacheBlockInd
+		s.mu.table[cacheBlockInd] = &k
 
-		writeAt := cacheBlockInd * int64(s.blockSize)
+		writeAt := cacheBlockInd * int64(s.blockSize) + s.numMetadataBlocks * int64(s.blockSize)
 		writeSize := s.blockSize
+		if writeAt + int64(writeSize) < s.numMetadataBlocks * int64(s.blockSize) {
+			panic(fmt.Sprintf("writing a data block to the metadata block section: %v %v %v %v", writeAt, writeSize, s.numMetadataBlocks, s.blockSize))
+		}
+
+		entry := metadataLogEntry{
+			filenum: k.filenum,
+			logicalBlockInd: k.logicalBlockInd,
+			cacheBlockInd: cacheBlockInd,
+		}
 
 		if len(p[n:]) <= writeSize {
 			// Ignore num written ret value, since if partial write, an error
 			// is returned.
 			_, err := s.file.WriteAt(p[n:], writeAt)
-			return err
+			if err != nil {
+				return err
+			}
+
+			// TODO(josh): It is not safe to update the contents of the cache & the metadata in two
+			// disk writes like this, without the working set scheme described by Radu at
+			// https://github.com/cockroachdb/pebble/issues/2542. We will implement that later.
+			return s.persistMetadataUpdate(entry)
 		}
+
 		numWritten, err := s.file.WriteAt(p[n:n+writeSize], writeAt)
 		if err != nil {
+			return err
+		}
+
+		if err := s.persistMetadataUpdate(entry); err != nil {
 			return err
 		}
 
 		// Note that numWritten == writeSize, since we checked for an error above.
 		n += numWritten
 	}
+}
+
+func (s *sharedCacheShard) persistMetadataUpdate(e metadataLogEntry) error {
+	ptr := int64(s.mu.seq) % s.numDataBlocks
+	batch := metadataLogEntryBatch{
+		e1:  e,
+		seq: s.mu.seq,
+	}
+	if s.mu.table[ptr] != nil {
+		batch.e2 = metadataLogEntry{
+			filenum: s.mu.table[ptr].filenum,
+			logicalBlockInd: s.mu.table[ptr].logicalBlockInd,
+			cacheBlockInd: ptr,
+		}
+	}
+
+	// TODO(josh): This serialization scheme is not intended to be portable across machine
+	// architectures. We can make it portable in a later PR.
+	batchAsBytes := (*[unsafe.Sizeof(metadataLogEntryBatch{})]byte)(unsafe.Pointer(&batch))[:]
+	// TODO(): Used to be 2x.
+	writeAt := int64(s.mu.seq) % s.numDataBlocks * int64(unsafe.Sizeof(metadataLogEntryBatch{}))
+	if writeAt + int64(len(batchAsBytes)) > s.numMetadataBlocks * int64(s.blockSize) {
+		panic(fmt.Sprintf("writing a metadata block to the data block section: %v %v %v %v", writeAt, len(batchAsBytes), s.numMetadataBlocks, s.blockSize))
+	}
+
+	_, err := s.file.WriteAt(batchAsBytes, writeAt)
+	if err != nil {
+		return err
+	}
+
+	// TODO(): Keep seq from overflowing, by moding by something, or similar.
+	s.mu.seq++ // mu is held; see Set; fine-grained locking can be done later on
+	return nil
 }

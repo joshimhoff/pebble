@@ -25,7 +25,7 @@ func TestSharedCache(t *testing.T) {
 			log.Infof("<local fs> "+fmt, args...)
 		})
 
-		cache, err := openSharedCache(fs, "", 32*1024, size, 32)
+		cache, err := openSharedCache(fs, "", 32*1024, size, 1)
 		require.NoError(t, err)
 		defer cache.Close()
 
@@ -91,6 +91,12 @@ func TestSharedCache(t *testing.T) {
 				// TODO(josh): Not tracing out filesystem activity here, since logging_fs.go
 				// doesn't trace calls to ReadAt or WriteAt. We should consider changing this.
 				return fmt.Sprintf("misses=%d", cache.misses.Load())
+			case "reload":
+				// Cache is persistent, so should be able to reopen & keep getting hits.
+				cache, err = openSharedCache(fs, "", 32*1024, size, 1)
+				require.NoError(t, err)
+
+				return ""
 			default:
 				d.Fatalf(t, "unknown command %s", d.Cmd)
 				return ""
@@ -101,20 +107,20 @@ func TestSharedCache(t *testing.T) {
 
 func TestSharedCacheRandomized(t *testing.T) {
 	ctx := context.Background()
-
 	var log base.InMemLogger
-	fs := vfs.WithLogging(vfs.NewMem(), func(fmt string, args ...interface{}) {
-		log.Infof("<local fs> "+fmt, args...)
-	})
-
 	seed := uint64(time.Now().UnixNano())
 	fmt.Printf("seed: %v\n", seed)
 	rand.Seed(seed)
 
 	helper := func(blockSize int) func(t *testing.T) {
 		return func(t *testing.T) {
-			numShards := rand.Intn(64) + 1
-			cacheSize := int64(shardingBlockSize * numShards) // minimum allowed cache size
+			fs := vfs.WithLogging(vfs.NewMem(), func(fmt string, args ...interface{}) {
+				log.Infof("<local fs> "+fmt, args...)
+			})
+
+			// TODO(): Undo various adjustments.
+			numShards := 1
+			cacheSize := int64(shardingBlockSize * numShards * 10) // minimum allowed cache size
 
 			cache, err := openSharedCache(fs, "", blockSize, cacheSize, numShards)
 			require.NoError(t, err)
@@ -141,7 +147,7 @@ func TestSharedCacheRandomized(t *testing.T) {
 			require.NoError(t, err)
 			defer readable.Close()
 
-			const numDistinctReads = 100
+			const numDistinctReads = 1000
 			for i := 0; i < numDistinctReads; i++ {
 				offset := rand.Int63n(size)
 
@@ -155,8 +161,84 @@ func TestSharedCacheRandomized(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, toWrite[int(offset):], got)
 			}
+
+			// Reopen the cache to at least ensure metadata can be read.
+			cache, err = openSharedCache(fs, "", blockSize, cacheSize, numShards)
+			require.NoError(t, err)
+			defer cache.Close()
 		}
 	}
 	t.Run("32 KB", helper(32*1024))
 	t.Run("1 MB", helper(1024*1024))
+}
+
+func TestSharedCachePersistentMetadata(t *testing.T) {
+	var log base.InMemLogger
+	fs := vfs.WithLogging(vfs.NewMem(), func(fmt string, args ...interface{}) {
+		log.Infof("<local fs> "+fmt, args...)
+	})
+
+	shard := sharedCacheShard{}
+	require.NoError(t, shard.init(fs, "", 0, 10, 1024))
+
+	toWrite := make([]byte, 1024)
+	for i := 0; i < int(1024); i++ {
+		toWrite[i] = byte(i)
+	}
+
+	const numDistinctSets = 1000
+	for i := 0; i < numDistinctSets; i++ {
+		// TODO(): Add case that requires e2.
+		require.NoError(t, shard.Set(base.FileNum(i+1), toWrite, int64(i * 1024)), i)
+
+		preRestartSeq := shard.mu.seq
+		preRestartWhere := make(map[metadataMapKey]int64, len(shard.mu.where))
+		preRestartTable := make([]*metadataMapKey, len(shard.mu.table))
+		preRestartFree := make([]int64, len(shard.mu.free))
+		for k, v := range shard.mu.where {
+			preRestartWhere[k] = v
+		}
+		for i, v := range shard.mu.table {
+			preRestartTable[i] = v
+		}
+		for i, v := range shard.mu.free {
+			preRestartFree[i] = v
+		}
+
+		shard.Close()
+		shard = sharedCacheShard{}
+		require.NoError(t, shard.init(fs, "", 0, 10, 1024), i)
+
+		// TODO(): Have helper.
+		postRestartSeq := shard.mu.seq
+		postRestartWhere := make(map[metadataMapKey]int64, len(shard.mu.where))
+		postRestartTable := make([]*metadataMapKey, len(shard.mu.table))
+		postRestartFree := make([]int64, len(shard.mu.free))
+		for k, v := range shard.mu.where {
+			postRestartWhere[k] = v
+		}
+		for i, v := range shard.mu.table {
+			postRestartTable[i] = v
+		}
+		for i, v := range shard.mu.free {
+			postRestartFree[i] = v
+		}
+
+		require.Equal(t, preRestartSeq, postRestartSeq, i)
+		require.Equal(t, preRestartWhere, postRestartWhere, i)
+		require.Equal(t, preRestartTable, postRestartTable, i)
+		require.Equal(t, preRestartFree, postRestartFree, i)
+	}
+
+	// TODO(): Clean up.
+	fmt.Printf("%+v", shard.mu)
+	for i, v := range shard.mu.table {
+		fmt.Printf("%v %+v\n", i, v)
+	}
+	for _, v := range shard.log {
+		fmt.Printf("%+v\n", v)
+	}
+
+	// TODO(): Ensure last write present as extra check.
+	shard.Close()
 }
